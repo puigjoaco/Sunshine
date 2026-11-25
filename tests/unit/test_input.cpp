@@ -297,3 +297,21 @@ TEST_F(InputGamepadSessionTest, RefreshesSharedVirtualInputAfterLicenseStateChan
   EXPECT_NE(context().mouse->device_id(), original_mouse_id);
   EXPECT_EQ(runtime().active_device_count(), active_devices);
 }
+
+TEST_F(InputGamepadSessionTest, PositionsVirtualOutputPointerInFullLogicalDesktop) {
+  input::position_cursor({0, 0, 8240, 1440, 8240, 1440}, 6680, 720);
+  const auto event = context().mouse->last_submitted_event();
+  EXPECT_EQ(event.kind, lvh::MouseEventKind::absolute_motion);
+  EXPECT_EQ(event.x, 6680);
+  EXPECT_EQ(event.y, 720);
+  EXPECT_EQ(event.width, 8240);
+  EXPECT_EQ(event.height, 1440);
+}
+
+TEST_F(InputGamepadSessionTest, IgnoresPointerPositionBeforeDesktopBoundsAreKnown) {
+  platf::virtualhid::move_mouse(context(), 4, 5);
+  input::position_cursor({0, 0, 0, 1440, 0, 1440}, 6680, 720);
+  EXPECT_EQ(context().mouse->last_submitted_event().kind, lvh::MouseEventKind::relative_motion);
+  input::position_cursor({0, 0, 8240, 0, 8240, 0}, 6680, 720);
+  EXPECT_EQ(context().mouse->last_submitted_event().kind, lvh::MouseEventKind::relative_motion);
+}

@@ -2969,6 +2969,7 @@ namespace video {
     void *channel_data
   ) {
     config = resolve_dynamic_range(*chosen_encoder, config);
+    config.client_stream = true;
 
     auto idr_events = mail->event<bool>(mail::idr);
 

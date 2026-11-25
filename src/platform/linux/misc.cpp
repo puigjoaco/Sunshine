@@ -63,6 +63,7 @@
 #include "src/entry_handler.h"
 #include "src/logging.h"
 #include "src/platform/common.h"
+#include "src/video.h"
 #include "vaapi.h"
 
 #ifdef __GNUC__
@@ -1289,7 +1290,21 @@ namespace platf {
     return true;
   }
 
-  std::shared_ptr<display_t> display(mem_type_e hwdevice_type, const std::string &display_name, const video::config_t &config) {
+  std::shared_ptr<display_t> display(mem_type_e hwdevice_type, const std::string &display_name, const video::config_t &requested_config) {
+#ifdef SUNSHINE_BUILD_KWIN
+    // Keep KMS available for startup probes and the greeter. Recheck Wayland on
+    // every real capture so a service started before login can use Plasma later.
+    if (config::video.virtual_display && requested_config.client_stream) {
+      if (auto virtual_display = kwin_display(hwdevice_type, display_name, requested_config)) {
+        return virtual_display;
+      }
+      BOOST_LOG(warning) << "[kwingrab] Virtual output unavailable; falling back to configured capture backend"sv;
+    }
+#endif
+    // The fallback captures an existing output; never retry virtual creation.
+    auto config = requested_config;
+    config.client_stream = false;
+
     // Please ensure that KMS followed by CUDA remains at the top so that we can
     // drop DRM worker privileges once neither backend requires it.
 

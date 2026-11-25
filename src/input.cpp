@@ -2289,6 +2289,14 @@ namespace input {
     });
   }
 
+  void position_cursor(const platf::touch_port_t &desktop, float x, float y) {
+    dispatch_input_task([desktop, x, y]() {
+      if (platf_input && desktop.width > 0 && desktop.height > 0) {
+        platf::abs_mouse(platf_input, desktop, x, y);
+      }
+    });
+  }
+
   void refresh_virtual_input() {
     dispatch_input_task([]() {
       if (platf_input) {

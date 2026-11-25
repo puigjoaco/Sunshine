@@ -76,6 +76,14 @@ namespace input {
   void refresh_virtual_input();
 
   /**
+   * @brief Queue one absolute pointer move to a newly created virtual display.
+   * @param desktop Logical bounds of the full compositor desktop.
+   * @param x Desired logical desktop X coordinate.
+   * @param y Desired logical desktop Y coordinate.
+   */
+  void position_cursor(const platf::touch_port_t &desktop, float x, float y);
+
+  /**
    * @brief Allocate and initialize platform input state for a stream.
    *
    * @param mail Mailbox used to exchange messages with worker threads.

@@ -12,6 +12,8 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cmath>
+#include <cstdio>
 #include <fstream>
 #include <memory>
 #include <pwd.h>
@@ -21,7 +23,9 @@
 #include <thread>
 
 // lib includes
+#include <boost/process/v1.hpp>
 #include <lizardbyte/common/env.h>
+#include <nlohmann/json.hpp>
 #include <pipewire/pipewire.h>
 #include <poll.h>
 #include <unistd.h>
@@ -34,7 +38,9 @@
 // local includes
 #include "cuda.h"
 #include "graphics.h"
+#include "kwin_virtual.h"
 #include "pipewire.cpp"
+#include "src/config.h"
 #include "src/platform/common.h"
 #include "src/video.h"
 
@@ -455,6 +461,99 @@ namespace kwin {
       return 0;
     }
 
+    /**
+     * @brief Create an owned client-sized output; closing this stream removes it.
+     * @param config Actual Moonlight stream dimensions and refresh rate.
+     * @return Zero on success, minus one on failure; never changes physical outputs.
+     */
+    int start_virtual(const video::config_t &config) {
+      const auto fps = video::framerate_to_rational(config);
+      const auto mode = virtual_mode(config::video.virtual_display, config.client_stream, config.width, config.height, av_q2d(fps), config::video.virtual_display_scale);
+      if (!mode || !kde_screencast_v1_ || wl_proxy_get_version(reinterpret_cast<wl_proxy *>(kde_screencast_v1_)) < 2) {
+        return -1;
+      }
+      static std::atomic_uint sequence = 0;
+      const auto name = std::format("Sunshine-{}-{}", getpid(), sequence++);
+      const auto output_name = "Virtual-" + name;
+      const auto scale = mode->scale;
+      // KWin's DRM backend takes physical pixels despite the protocol XML's
+      // historical 'logical resolution' wording. KScreen applies scale after
+      // output discovery because Plasma may override the requested initial scale.
+      if (wl_proxy_get_version(reinterpret_cast<wl_proxy *>(kde_screencast_v1_)) >= 4) {
+        kde_screencast_stream_v1_ = zkde_screencast_unstable_v1_stream_virtual_output_with_description(
+          kde_screencast_v1_,
+          name.c_str(),
+          "Sunshine client desktop",
+          config.width,
+          config.height,
+          wl_fixed_from_double(scale),
+          ZKDE_SCREENCAST_UNSTABLE_V1_POINTER_EMBEDDED
+        );
+      } else {
+        kde_screencast_stream_v1_ = zkde_screencast_unstable_v1_stream_virtual_output(
+          kde_screencast_v1_,
+          name.c_str(),
+          config.width,
+          config.height,
+          wl_fixed_from_double(scale),
+          ZKDE_SCREENCAST_UNSTABLE_V1_POINTER_EMBEDDED
+        );
+      }
+      zkde_screencast_stream_unstable_v1_add_listener(kde_screencast_stream_v1_, &stream_listener, this);
+      if (wait_for_stream() < 0 || stream_failed || !stream_ready) {
+        BOOST_LOG(error) << "[kwingrab] Virtual output creation failed: " << stream_error_msg;
+        return -1;
+      }
+
+      auto outputs_json = run_kscreen({"-j"});
+      auto find_output = [&](const nlohmann::json &state) -> nlohmann::json {
+        for (const auto &output : state.value("outputs", nlohmann::json::array())) {
+          if (output.value("name", "") == output_name) {
+            return output;
+          }
+        }
+        return {};
+      };
+      auto output = find_output(outputs_json);
+      if (output.empty()) {
+        BOOST_LOG(error) << "[kwingrab] KScreen did not discover owned virtual output";
+        return -1;
+      }
+      const auto refresh_mhz = mode->refresh_mhz;
+      auto find_mode = [&]() -> std::string {
+        for (const auto &mode : output.at("modes")) {
+          if (mode.at("size").value("width", 0) == config.width && mode.at("size").value("height", 0) == config.height && std::abs(mode.value("refreshRate", 0.0) * 1000 - refresh_mhz) <= 2) {
+            return mode.at("id").get<std::string>();
+          }
+        }
+        return {};
+      };
+      auto mode_id = find_mode();
+      if (mode_id.empty()) {
+        run_kscreen({std::format("output.{}.addCustomMode.{}.{}.{}.reduced", output_name, config.width, config.height, refresh_mhz)});
+        output = find_output(run_kscreen({"-j"}));
+        if (output.empty() || (mode_id = find_mode()).empty()) {
+          BOOST_LOG(error) << "[kwingrab] Requested virtual refresh rate unavailable";
+          return -1;
+        }
+      }
+      run_kscreen({std::format("output.{}.mode.{}", output_name, mode_id), std::format("output.{}.scale.{}", output_name, scale)});
+      output = find_output(run_kscreen({"-j"}));
+      if (output.empty() || output.value("currentModeId", "") != mode_id || !output.value("enabled", false) || std::abs(output.value("scale", 0.0) - scale) > 0.001) {
+        BOOST_LOG(error) << "[kwingrab] Virtual output mode/scale verification failed";
+        return -1;
+      }
+      out_params = std::make_shared<output_parameter_t>();
+      out_params->name = output_name;
+      out_params->width = config.width;
+      out_params->height = config.height;
+      out_params->pos_x = output.at("pos").value("x", 0);
+      out_params->pos_y = output.at("pos").value("y", 0);
+      BOOST_LOG(info) << "[kwingrab] Created owned virtual output " << output_name << " " << config.width << "x" << config.height
+                      << "@" << refresh_mhz / 1000.0 << " scale=" << scale << " PipeWire node=" << out_node_id;
+      return 0;
+    }
+
     uint32_t out_node_id = PW_ID_ANY;  ///< Out node ID.
     uint64_t out_objectserial = SPA_ID_INVALID;  ///< Out objectserial.
     std::shared_ptr<output_parameter_t> out_params = nullptr;  ///< Out params.
@@ -472,11 +571,63 @@ namespace kwin {
     bool stream_ready = false;
     std::string stream_error_msg;
 
+    /**
+     * @brief Run KScreen with a bounded lifetime and no shell or pipe deadlock.
+     * @param args Argument vector; commands address only our virtual output.
+     * @return Parsed state for -j, or an empty object for commands or failure.
+     */
+    static nlohmann::json run_kscreen(const std::vector<std::string> &args) {
+      namespace bp = boost::process::v1;
+      try {
+        std::unique_ptr<FILE, decltype(&fclose)> output(tmpfile(), fclose);
+        if (!output) {
+          return {};
+        }
+        auto command = bp::search_path("kscreen-doctor");
+        if (command.empty()) {
+          BOOST_LOG(error) << "[kwingrab] Virtual outputs require kscreen-doctor";
+          return {};
+        }
+        bp::child child(command, bp::args(args), bp::std_in<bp::null, bp::std_out> output.get(), bp::std_err > bp::null, bp::limit_handles);
+        if (!child.wait_for(5s)) {
+          child.terminate();
+          child.wait();
+          BOOST_LOG(error) << "[kwingrab] kscreen-doctor timed out";
+          return {};
+        }
+        if (child.exit_code() != 0) {
+          BOOST_LOG(error) << "[kwingrab] kscreen-doctor failed with exit " << child.exit_code();
+          return {};
+        }
+        rewind(output.get());
+        std::string text;
+        std::array<char, 4096> buffer;
+        while (auto size = fread(buffer.data(), 1, buffer.size(), output.get())) {
+          text.append(buffer.data(), size);
+          if (text.size() > 1024 * 1024) {
+            return {};
+          }
+        }
+        if (!text.empty() && args == std::vector<std::string> {"-j"}) {
+          return nlohmann::json::parse(text);
+        }
+      } catch (const std::exception &exception) {
+        BOOST_LOG(error) << "[kwingrab] kscreen-doctor: " << exception.what();
+      }
+      return {};
+    }
+
     // Misc functions
     int wait_for_stream() {
       // Dispatch until we get created/failed, with a 5s timeout
       auto deadline = std::chrono::steady_clock::now() + 5s;
       while (!stream_ready && !stream_failed && std::chrono::steady_clock::now() < deadline) {
+        if (wl_display_dispatch_pending(wl_display) < 0) {
+          return -1;
+        }
+        if (stream_ready || stream_failed) {
+          break;
+        }
         wl_display_flush(wl_display);
 
         struct pollfd pfd = {};
@@ -618,7 +769,7 @@ namespace kwin {
     static void on_stream_closed(void *data, struct zkde_screencast_stream_unstable_v1 *stream [[maybe_unused]]) {
       auto *self = static_cast<screencast_t *>(data);
       BOOST_LOG(warning) << "[kwingrab] stream closed by server"sv;
-      self->stream_failed = false;
+      self->stream_failed = true;
       self->stream_ready = false;
       self->stream_error_msg = "stream closed by server";
     }
@@ -661,12 +812,26 @@ namespace kwin {
    */
   class kwin_t: public pipewire::pipewire_display_t {
   public:
+    /**
+     * @brief Retain the actual client configuration for virtual output creation.
+     * @param config Client configuration; probes leave client_stream false.
+     */
+    explicit kwin_t(const video::config_t &config):
+        pipewire_display_t {},
+        client_config(config) {}
+
     int configure_stream(const std::string &display_name, int &out_pipewire_fd, uint32_t &out_pipewire_node, uint64_t &out_pipewire_objectserial) override {
       screencast = std::make_unique<screencast_t>();
       if (screencast->init(true) < 0) {
         return -1;
       }
-      if (screencast->start(display_name) < 0) {
+      const bool virtual_output = config::video.virtual_display && client_config.client_stream;
+      try {
+        if ((virtual_output ? screencast->start_virtual(client_config) : screencast->start(display_name)) < 0) {
+          return -1;
+        }
+      } catch (const std::exception &exception) {
+        BOOST_LOG(error) << "[kwingrab] Virtual output configuration: " << exception.what();
         return -1;
       }
       if (screencast->out_params) {
@@ -686,6 +851,7 @@ namespace kwin {
       return -1;
     }
 
+    video::config_t client_config;  ///< Configuration of the capture owner.
     std::unique_ptr<screencast_t> screencast;  ///< Screencast.
   };
 }  // namespace kwin
@@ -706,11 +872,18 @@ namespace platf {
       return nullptr;
     }
 
-    auto display = std::make_shared<kwin::kwin_t>();
+    auto display = std::make_shared<kwin::kwin_t>(config);
     if (display->init(hwdevice_type, display_name, config)) {
       return nullptr;
     }
 
+    if (config::video.virtual_display && config.client_stream) {
+      input::position_cursor(
+        {0, 0, display->env_logical_width, display->env_logical_height, display->env_logical_width, display->env_logical_height},
+        display->offset_x + display->logical_width / 2.0f,
+        display->offset_y + display->logical_height / 2.0f
+      );
+    }
     return display;
   }
 

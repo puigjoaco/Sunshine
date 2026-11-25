@@ -137,6 +137,8 @@ namespace config {
     std::string encoder;  ///< Encoder backend name selected by configuration.
     std::string adapter_name;  ///< Display adapter name selected in configuration.
     std::string output_name;  ///< Display output name selected in configuration.
+    bool virtual_display;  ///< Create a client-sized KWin output for an actual stream, with KMS fallback.
+    int virtual_display_scale;  ///< KWin virtual-output scale as a percentage (100 means native pixels).
 
     /**
      * @brief Display-device integration settings.

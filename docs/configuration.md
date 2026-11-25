@@ -975,6 +975,36 @@ supported on the current platform.
     </tr>
 </table>
 
+### virtual_display
+
+Linux/KWin only. Default `disabled`. Set `virtual_display = enabled` to create an
+additional output at the launching Moonlight client's requested physical width,
+height and refresh rate. Requires KWin's screencast protocol, a working local
+PipeWire connection and `kscreen-doctor`. Physical output modes are preserved.
+Encoder probes use the configured capture backend and create no virtual output.
+If KWin is unavailable (including before login), capture falls back to the
+configured backend, for example `capture = kms` with a physical `output_name`.
+A stream already capturing the greeter needs a reconnect after login to choose
+the virtual output. If virtual capture fails, logs explicitly report fallback.
+
+The capture owner closes the screencast when the last stream ends, and KWin
+removes its output and relocates its windows. Abrupt network loss first waits
+for Sunshine's existing `ping_timeout` (default 10 seconds). Explicit disconnect
+removes the output immediately. Multiple simultaneous clients share one capture
+owner and the first client's virtual mode. Quit/disconnect the previous client
+before changing devices or requesting a different resolution.
+
+### virtual_display_scale
+
+Linux/KWin only. Integer percentage from `100` to `400`; default `100` means
+native pixel density. For example, `150` provides larger desktop controls while
+retaining the same physical stream resolution. The output is appended to the
+existing desktop. Relative mouse and keyboard share the local desktop seat;
+the cursor moves to the virtual output when capture starts. Click the virtual
+desktop or one of its windows to give it keyboard focus. Absolute mouse mapping
+uses the virtual output's logical bounds. This is an extra monitor, not an
+independent login, cursor or private desktop session.
+
 ### output_name
 
 <table>
