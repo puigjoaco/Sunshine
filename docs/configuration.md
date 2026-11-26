@@ -977,33 +977,122 @@ supported on the current platform.
 
 ### virtual_display
 
-Linux/KWin only. Default `disabled`. Set `virtual_display = enabled` to create an
-additional output at the launching Moonlight client's requested physical width,
-height and refresh rate. Requires KWin's screencast protocol, a working local
-PipeWire connection and `kscreen-doctor`. Physical output modes are preserved.
-Encoder probes use the configured capture backend and create no virtual output.
-If KWin is unavailable (including before login), capture falls back to the
-configured backend, for example `capture = kms` with a physical `output_name`.
-A stream already capturing the greeter needs a reconnect after login to choose
-the virtual output. If virtual capture fails, logs explicitly report fallback.
+Linux/KWin only. Default `disabled`. Set `virtual_display = enabled` to create
+an output at the launching Moonlight client's requested physical width, height
+and refresh rate. Landscape and portrait (for example 1440×3120) are accepted.
+Requires KWin's screencast protocol, a local PipeWire connection and
+`kscreen-doctor`. Encoder probes create no virtual output. If KWin is unavailable
+(including before login), capture falls back to the configured backend, for
+example `capture = kms` with a physical `output_name`. Reconnect after logging
+in to switch a greeter stream to KWin. Failed virtual initialization restores
+exclusive state immediately before falling back.
 
-The capture owner closes the screencast when the last stream ends, and KWin
-removes its output and relocates its windows. Abrupt network loss first waits
-for Sunshine's existing `ping_timeout` (default 10 seconds). Explicit disconnect
-removes the output immediately. Multiple simultaneous clients share one capture
-owner and the first client's virtual mode. Quit/disconnect the previous client
-before changing devices or requesting a different resolution.
+Only one client at a time is supported for exclusive mode. Simultaneous clients
+share one capture owner and its mode. Abrupt network loss first waits for
+`ping_timeout` (default 10 seconds); the restore grace starts when capture ends.
+This uses the existing desktop login, keyboard, mouse and audio seat.
+
+### virtual_display_mode
+
+Linux/KWin only. `extend` (default) keeps the existing desktop layout and adds
+the client display. `exclusive` makes the client-sized virtual output primary,
+moves application windows and Plasma's primary desktop/panels to it, and tries
+to make every physical connector a scaled replica of that output. **Physical
+monitors remain enabled and powered on.** They show the same desktop as the
+phone and cease to be independent logical screens while mirroring is active.
+KWin handles aspect-ratio fitting when the physical and virtual modes differ.
+
+The installed `sunshine-kwin-output` helper uses output-management v2's
+`set_replication_source` (version 13+) with the virtual device's UUID.
+`kscreen-doctor` exposes replication state in JSON but cannot set it. The helper
+only changes replication; it sends no enable/disable or DPMS requests. The
+policy checks compositor readback and that original connectors stay enabled.
+
+If replication is unavailable or rejected, physical monitors remain independent
+and enabled at their existing modes/scales. Their logical positions temporarily
+move beyond the virtual viewport, all panels move to the virtual display, and
+a temporary KWin script routes existing and new application windows to it and
+keeps them within its bounds. The physical monitors then show their Plasma
+wallpaper desktops, including any desktop icons/widgets; they carry no panels
+or application windows after routing. This fallback is reported in logs as
+`policy=move`; working replication is `policy=mirror`.
+
+Exclusive mode additionally requires `/usr/bin/python3`, `python3-dbus`,
+`python3-gi`, `qdbus6`, the `kwin-exclusive.py` asset, and its adjacent native
+`sunshine-kwin-output` helper. Before creating the virtual output, an independent
+guardian syncs the original connector modes (size and fractional refresh),
+positions, scale, rotation, enabled status, priorities and replication sources;
+window opaque IDs, output names, visible geometry and maximized/fullscreen/
+minimized states; and Plasma desktop/panel containment IDs and connector
+assignments. Recovery data lives at
+`$XDG_STATE_HOME/sunshine/kwin-exclusive.json` (default
+`~/.local/state/sunshine/kwin-exclusive.json`, mode 0600). It records no window
+titles, widget contents or application data. A connected physical connector that
+was already disabled causes exclusive initialization to fall back to normal
+capture: this policy never disables a connector, including during restoration.
+
+The guardian clears temporary replicas, restores the physical layout and Plasma
+assignments, then restores surviving windows before releasing the virtual
+output. Failed exact restoration enables connected original outputs at preferred
+modes and retains the snapshot for retry. A lost guardian is recovered by
+Sunshine; a lost Sunshine lifeline triggers immediate guardian recovery.
+**Service deployments must also run the helper's `restore` action in
+`ExecStopPost`**, under the same user and Wayland/D-Bus environment, to cover a
+crash that kills the entire service process group. Allow at least 60 seconds
+for service shutdown/recovery. Snapshots are bound to the boot and exact KWin/
+Wayland session. Foreign-session, legacy or corrupt snapshots are archived as
+`kwin-exclusive.stale-<id>.json` without changing the current desktop. Output
+recovery intent and completion are synced separately: a retained panel/window
+mismatch never causes the old monitor layout to be replayed over later user
+changes. After an interrupted output transaction, recovery brings the desktop
+onto available physical outputs and retains the original snapshot instead of
+replaying an uncertain layout. Plasma assignments are retried for a bounded
+interval and verified; missing connectors/containments keep the snapshot.
+Retained Sunshine outputs are parked outside the physical viewport during
+recovery so Plasma does not hide an overlapping physical connector as redundant.
+Only these temporary outputs move on subsequent recovery retries.
+Degraded recovery also moves panels and surviving windows onto available
+physical outputs after selecting preferred modes. For example, using the actual
+installed asset path:
+
+@code{.ini}
+ExecStopPost=/usr/bin/python3 /usr/share/sunshine/kwin-exclusive.py restore
+TimeoutStopSec=60
+@endcode
+
+Emergency restore, run as the desktop user in its session (adjust install path):
+
+@code{.sh}
+/usr/bin/python3 /usr/share/sunshine/kwin-exclusive.py restore
+@endcode
+
+It also signals a running guardian to restore immediately. Closed windows cannot
+be recreated. Custom tiling trees, application placement rules, and the hidden
+restore rectangle behind a maximized/fullscreen window may limit exact
+restoration. The snapshot is retained if visible window restoration does not
+verify. KWin/PipeWire absence before desktop login leaves the KMS greeter path
+unchanged; recovery without a snapshot is a no-op and needs no Plasma session.
+
+### virtual_display_restore_delay
+
+Linux/KWin exclusive mode only. Integer seconds from `0` to `60`; default `5`.
+Retain the last virtual output and original snapshot after capture ends. A client
+reconnecting within this interval claims that same output and changes its
+physical mode, including swapped portrait dimensions, while its physical mirrors
+stay enabled. Keeping the output avoids KWin reloading a remembered layout during
+hotplug. Each reconnect starts a new PipeWire capture and encoder session.
+The client must request its new dimensions; Sunshine does not detect phone
+rotation itself. Unsupported resize/custom modes restore immediately and use the
+normal capture fallback. Sunshine exit/crash, initialization failure and emergency
+restore bypass grace. `0` restores the original layout at every disconnect.
 
 ### virtual_display_scale
 
 Linux/KWin only. Integer percentage from `100` to `400`; default `100` means
-native pixel density. For example, `150` provides larger desktop controls while
-retaining the same physical stream resolution. The output is appended to the
-existing desktop. Relative mouse and keyboard share the local desktop seat;
-the cursor moves to the virtual output when capture starts. Click the virtual
-desktop or one of its windows to give it keyboard focus. Absolute mouse mapping
-uses the virtual output's logical bounds. This is an extra monitor, not an
-independent login, cursor or private desktop session.
+native pixel density. For example, `150` enlarges desktop controls while keeping
+the requested physical stream resolution. Absolute mouse mapping uses logical
+output bounds; relative input shares the local seat. Click a desktop/window to
+give it keyboard focus.
 
 ### output_name
 

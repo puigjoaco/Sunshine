@@ -38,6 +38,7 @@
 // local includes
 #include "cuda.h"
 #include "graphics.h"
+#include "kwin_exclusive.h"
 #include "kwin_virtual.h"
 #include "pipewire.cpp"
 #include "src/config.h"
@@ -464,7 +465,7 @@ namespace kwin {
     /**
      * @brief Create an owned client-sized output; closing this stream removes it.
      * @param config Actual Moonlight stream dimensions and refresh rate.
-     * @return Zero on success, minus one on failure; never changes physical outputs.
+     * @return Zero on success, minus one on failure; output policy is applied later.
      */
     int start_virtual(const video::config_t &config) {
       const auto fps = video::framerate_to_rational(config);
@@ -505,6 +506,25 @@ namespace kwin {
         return -1;
       }
 
+      out_params = std::make_shared<output_parameter_t>();
+      out_params->name = output_name;
+      return configure_virtual(config);
+    }
+
+    /**
+     * @brief Resize the same protocol-owned output without a disruptive hotplug.
+     * @param config Replacement stream's physical mode and scale.
+     * @return Zero after KScreen mode readback; minus one on unsupported modes.
+     */
+    int configure_virtual(const video::config_t &config) {
+      const auto fps = video::framerate_to_rational(config);
+      const auto mode = virtual_mode(config::video.virtual_display, config.client_stream, config.width, config.height, av_q2d(fps), config::video.virtual_display_scale);
+      if (!mode || !out_params) {
+        return -1;
+      }
+      const auto output_name = out_params->name;
+      const auto scale = mode->scale;
+
       auto outputs_json = run_kscreen({"-j"});
       auto find_output = [&](const nlohmann::json &state) -> nlohmann::json {
         for (const auto &output : state.value("outputs", nlohmann::json::array())) {
@@ -543,8 +563,6 @@ namespace kwin {
         BOOST_LOG(error) << "[kwingrab] Virtual output mode/scale verification failed";
         return -1;
       }
-      out_params = std::make_shared<output_parameter_t>();
-      out_params->name = output_name;
       out_params->width = config.width;
       out_params->height = config.height;
       out_params->pos_x = output.at("pos").value("x", 0);
@@ -820,15 +838,46 @@ namespace kwin {
         pipewire_display_t {},
         client_config(config) {}
 
-    int configure_stream(const std::string &display_name, int &out_pipewire_fd, uint32_t &out_pipewire_node, uint64_t &out_pipewire_objectserial) override {
-      screencast = std::make_unique<screencast_t>();
-      if (screencast->init(true) < 0) {
-        return -1;
+    /** @brief Retain a successfully initialized exclusive output for reconnects. */
+    ~kwin_t() override {
+      if (exclusive) {
+        exclusive_t::instance().finish(std::move(screencast), ready ? config::video.virtual_display_restore_delay : 0);
       }
+    }
+
+    int configure_stream(const std::string &display_name, int &out_pipewire_fd, uint32_t &out_pipewire_node, uint64_t &out_pipewire_objectserial) override {
       const bool virtual_output = config::video.virtual_display && client_config.client_stream;
-      try {
-        if ((virtual_output ? screencast->start_virtual(client_config) : screencast->start(display_name)) < 0) {
+      const bool want_exclusive = virtual_output && config::video.virtual_display_mode == "exclusive";
+      if (want_exclusive) {
+        screencast = std::static_pointer_cast<screencast_t>(exclusive_t::instance().resume());
+        exclusive = screencast != nullptr;
+      }
+      const bool resumed = exclusive;
+      if (!screencast) {
+        screencast = std::make_shared<screencast_t>();
+        if (screencast->init(true) < 0) {
           return -1;
+        }
+        if (want_exclusive) {
+          if (!exclusive_t::instance().prepare(screencast.get())) {
+            return -1;
+          }
+          exclusive = true;
+        }
+      }
+      try {
+        if ((resumed ? screencast->configure_virtual(client_config) : virtual_output ? screencast->start_virtual(client_config) :
+                                                                                       screencast->start(display_name)) < 0) {
+          return -1;
+        }
+        if (want_exclusive) {
+          if (!exclusive_t::instance().begin(screencast.get(), screencast->out_params->name)) {
+            return -1;
+          }
+          exclusive = true;
+          // Exclusive makes the sole output the origin of the desktop.
+          screencast->out_params->pos_x = 0;
+          screencast->out_params->pos_y = 0;
         }
       } catch (const std::exception &exception) {
         BOOST_LOG(error) << "[kwingrab] Virtual output configuration: " << exception.what();
@@ -852,7 +901,9 @@ namespace kwin {
     }
 
     video::config_t client_config;  ///< Configuration of the capture owner.
-    std::unique_ptr<screencast_t> screencast;  ///< Screencast.
+    std::shared_ptr<screencast_t> screencast;  ///< Screencast, optionally retained across reconnects.
+    bool exclusive = false;  ///< The guardian owns an exclusive snapshot for this capture.
+    bool ready = false;  ///< Full PipeWire initialization succeeded, permitting reconnect grace.
   };
 }  // namespace kwin
 
@@ -876,6 +927,7 @@ namespace platf {
     if (display->init(hwdevice_type, display_name, config)) {
       return nullptr;
     }
+    display->ready = true;
 
     if (config::video.virtual_display && config.client_stream) {
       input::position_cursor(

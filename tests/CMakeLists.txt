@@ -96,6 +96,16 @@ endif()
 # Remove the existing definition from SUNSHINE_DEFINITIONS to avoid redefinition error
 list(FILTER SUNSHINE_DEFINITIONS EXCLUDE REGEX "^SUNSHINE_ASSETS_DIR=")
 list(APPEND TEST_DEFINITIONS SUNSHINE_ASSETS_DIR="${SUNSHINE_TEST_RUNTIME_DIR}/test_assets")
+if(KWIN_FOUND)
+    add_custom_target(stage_kwin_test_assets
+            COMMAND ${CMAKE_COMMAND} -E make_directory "${SUNSHINE_TEST_RUNTIME_DIR}/test_assets"
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_SOURCE_DIR}/src_assets/linux/assets/kwin-exclusive.py"
+            "${SUNSHINE_TEST_RUNTIME_DIR}/test_assets/kwin-exclusive.py"
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different "$<TARGET_FILE:sunshine-kwin-output>"
+            "${SUNSHINE_TEST_RUNTIME_DIR}/test_assets/sunshine-kwin-output"
+            DEPENDS sunshine-kwin-output "${CMAKE_SOURCE_DIR}/src_assets/linux/assets/kwin-exclusive.py")
+endif()
 
 if(NOT WIN32)
     find_package(Udev 255)  # we need 255+ for udevadm verify
@@ -183,6 +193,9 @@ list(REMOVE_ITEM SUNSHINE_SOURCES ${CMAKE_SOURCE_DIR}/src/main.cpp)
 add_executable(${PROJECT_NAME}
         ${TEST_SOURCES}
         ${SUNSHINE_SOURCES})
+if(KWIN_FOUND)
+    add_dependencies(${PROJECT_NAME} stage_kwin_test_assets)
+endif()
 
 # Copy files needed for config consistency tests to build directory
 # This ensures both CLI and CLion can access the same files relative to the test executable

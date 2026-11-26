@@ -139,6 +139,8 @@ namespace config {
     std::string output_name;  ///< Display output name selected in configuration.
     bool virtual_display;  ///< Create a client-sized KWin output for an actual stream, with KMS fallback.
     int virtual_display_scale;  ///< KWin virtual-output scale as a percentage (100 means native pixels).
+    std::string virtual_display_mode;  ///< KWin output policy: extend or exclusive.
+    int virtual_display_restore_delay;  ///< Seconds to retain the exclusive output for a reconnect.
 
     /**
      * @brief Display-device integration settings.

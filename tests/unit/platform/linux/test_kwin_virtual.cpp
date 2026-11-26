@@ -6,7 +6,16 @@
 #include "../../../tests_common.h"
 
 // standard includes
+#include <fstream>
 #include <limits>
+#include <thread>
+#include <utility>
+
+extern "C" {
+#include <libavcodec/avcodec.h>
+#include <libavutil/imgutils.h>
+#include <libavutil/opt.h>
+}
 
 // local includes
 #include "src/platform/linux/kwin_virtual.h"
@@ -24,6 +33,215 @@ TEST(KwinVirtualOutputTest, KeepsPhonePixelsIndependentOfLogicalScale) {
   EXPECT_EQ(mode->refresh_mhz, 60000);
   EXPECT_DOUBLE_EQ(mode->scale, 1.5);
 }
+
+TEST(KwinVirtualOutputTest, AcceptsPortraitWithoutSwappingOrCroppingPixels) {
+  const auto mode = kwin::virtual_mode(true, true, 1440, 3120, 60, 100);
+  ASSERT_TRUE(mode);
+  EXPECT_EQ(mode->width, 1440);
+  EXPECT_EQ(mode->height, 3120);
+  EXPECT_EQ(mode->refresh_mhz, 60000);
+  EXPECT_DOUBLE_EQ(mode->scale, 1);
+}
+
+#if defined(SUNSHINE_BUILD_KWIN)
+  #include "src/config.h"
+  #include "src/input.h"
+  #include "src/platform/linux/kwin_exclusive.h"
+  #include "src/video.h"
+
+  #include <lizardbyte/common/env.h>
+  #include <nlohmann/json.hpp>
+  #include <signal.h>
+
+namespace platf {
+  std::shared_ptr<display_t> kwin_display(mem_type_e type, const std::string &name, const video::config_t &config);
+  std::vector<std::string> kwin_display_names();
+}  // namespace platf
+
+TEST(KwinCaptureReconnectNestedTest, RetainsRealScreencastAndNegotiatesPortraitFrames) {
+  const auto runtime = lizardbyte::common::get_env("XDG_RUNTIME_DIR");
+  if (lizardbyte::common::get_env("SUNSHINE_TEST_KWIN_CAPTURE_RECONNECT") != "1" || runtime.find("/sunshine-exclusive-") == std::string::npos) {
+    GTEST_SKIP() << "Requires the isolated nested-KWin test harness";
+  }
+  // No input backend is ever allocated in this separate test process. The
+  // production cursor-position call therefore cannot reach a shared uinput seat.
+  input::testing::set_platform_input({});
+  const auto saved = config::video;
+  const auto restore = util::fail_guard([&] {
+    config::video = saved;
+  });
+  config::video.capture = "kwin";
+  config::video.virtual_display = true;
+  config::video.virtual_display_mode = "exclusive";
+  config::video.virtual_display_scale = 100;
+  config::video.virtual_display_restore_delay = 1;
+  const auto platform = platf::init();
+  ASSERT_TRUE(platform);
+  video::config_t client {};
+  client.width = 3120;
+  client.height = 1440;
+  client.framerate = 60;
+  client.client_stream = true;
+  auto owned_names = [] {
+    auto names = platf::kwin_display_names();
+    std::erase_if(names, [](const auto &name) {
+      return !name.starts_with("Virtual-Sunshine-");
+    });
+    return names;
+  };
+  auto frame = [](const std::shared_ptr<platf::display_t> &display, int width, int height) {
+    bool cursor = false;
+    bool captured = false;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    const auto status = display->capture(
+      [&](std::shared_ptr<platf::img_t> &&image, bool valid) {
+        captured = valid && image && image->width == width && image->height == height;
+        return !captured && std::chrono::steady_clock::now() < deadline;
+      },
+      [&](std::shared_ptr<platf::img_t> &image) {
+        image = display->alloc_img();
+        return image != nullptr;
+      },
+      &cursor
+    );
+    return std::pair {status, captured};
+  };
+  auto display = platf::kwin_display(platf::mem_type_e::system, "", client);
+  ASSERT_TRUE(display);
+  const auto first = frame(display, 3120, 1440);
+  ASSERT_EQ(first.first, platf::capture_e::ok);
+  ASSERT_TRUE(first.second);
+  const auto landscape = owned_names();
+  ASSERT_EQ(landscape.size(), 1);
+  display.reset();
+  client.width = 1440;
+  client.height = 3120;
+  display = platf::kwin_display(platf::mem_type_e::system, "", client);
+  ASSERT_TRUE(display);
+  auto portrait = frame(display, 1440, 3120);
+  if (portrait.first == platf::capture_e::reinit) {
+    // PipeWire can first announce the old format, then invalidate it when KWin
+    // publishes the resized source. Follow the same reinit contract as video.cpp.
+    display.reset();
+    display = platf::kwin_display(platf::mem_type_e::system, "", client);
+    ASSERT_TRUE(display);
+    portrait = frame(display, 1440, 3120);
+  }
+  ASSERT_EQ(portrait.first, platf::capture_e::ok);
+  ASSERT_TRUE(portrait.second);
+  EXPECT_EQ(display->width, 1440);
+  EXPECT_EQ(display->height, 3120);
+  EXPECT_EQ(owned_names(), landscape);
+  display.reset();
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+  while (!owned_names().empty() && std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  }
+  EXPECT_TRUE(owned_names().empty());
+}
+
+TEST(KwinExclusiveNestedTest, ReconnectKeepsOutputAndFinalDisconnectExpires) {
+  const auto name = lizardbyte::common::get_env("SUNSHINE_TEST_KWIN_EXCLUSIVE_OUTPUT");
+  const auto runtime = lizardbyte::common::get_env("XDG_RUNTIME_DIR");
+  if (name.empty() || runtime.find("/sunshine-exclusive-") == std::string::npos) {
+    GTEST_SKIP() << "Requires the isolated nested-KWin test harness";
+  }
+  auto output = std::make_shared<int>(42);
+  std::weak_ptr<int> lifetime = output;
+  auto &lease = kwin::exclusive_t::instance();
+  ASSERT_TRUE(lease.prepare(output.get()));
+  ASSERT_TRUE(lease.begin(output.get(), name));
+  lease.finish(std::move(output), 5);
+  std::this_thread::sleep_for(std::chrono::milliseconds(250));
+  EXPECT_FALSE(lifetime.expired());
+  auto resumed = lease.resume();
+  ASSERT_TRUE(resumed);
+  ASSERT_EQ(resumed.get(), lifetime.lock().get());
+  ASSERT_TRUE(lease.begin(resumed.get(), name));
+  lease.finish(std::move(resumed), 1);
+  std::this_thread::sleep_for(std::chrono::milliseconds(250));
+  EXPECT_FALSE(lifetime.expired());
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+  while (!lifetime.expired() && std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  }
+  EXPECT_TRUE(lifetime.expired());
+}
+
+TEST(KwinExclusiveNestedTest, RecoversSavedDeskWhenGuardianIsKilled) {
+  const auto name = lizardbyte::common::get_env("SUNSHINE_TEST_KWIN_EXCLUSIVE_OUTPUT");
+  const auto runtime = lizardbyte::common::get_env("XDG_RUNTIME_DIR");
+  if (name.empty() || runtime.find("/sunshine-exclusive-") == std::string::npos) {
+    GTEST_SKIP() << "Requires the isolated nested-KWin test harness";
+  }
+  auto output = std::make_shared<int>(42);
+  auto &lease = kwin::exclusive_t::instance();
+  ASSERT_TRUE(lease.prepare(output.get()));
+  ASSERT_TRUE(lease.begin(output.get(), name));
+  const auto path = std::filesystem::path(lizardbyte::common::get_env("XDG_STATE_HOME")) / "sunshine/kwin-exclusive.json";
+  std::ifstream snapshot(path);
+  const auto state = nlohmann::json::parse(snapshot);
+  ASSERT_EQ(kill(state.at("guardian_pid").get<int>(), SIGKILL), 0);
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
+  while (std::filesystem::exists(path) && std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  }
+  EXPECT_FALSE(std::filesystem::exists(path));
+  lease.finish(std::move(output), 0);
+}
+
+TEST(KwinExclusiveNestedTest, ActiveLeaseRestoresImmediatelyAtProcessExit) {
+  const auto name = lizardbyte::common::get_env("SUNSHINE_TEST_KWIN_EXCLUSIVE_OUTPUT");
+  const auto runtime = lizardbyte::common::get_env("XDG_RUNTIME_DIR");
+  if (name.empty() || runtime.find("/sunshine-exclusive-") == std::string::npos) {
+    GTEST_SKIP() << "Requires the isolated nested-KWin test harness";
+  }
+  auto output = std::make_shared<int>(42);
+  auto &lease = kwin::exclusive_t::instance();
+  ASSERT_TRUE(lease.prepare(output.get()));
+  ASSERT_TRUE(lease.begin(output.get(), name));
+  // Deliberately leave the lease active. The harness verifies restore after exit,
+  // while its independent Wayland owner keeps the virtual output connected.
+}
+
+TEST(KwinPortraitEncoderTest, EncodesNativePortraitFrameWithoutADisplay) {
+  if (lizardbyte::common::get_env("SUNSHINE_TEST_NVENC_PORTRAIT") != "1") {
+    GTEST_SKIP() << "Explicit opt-in required for NVIDIA hardware encoding";
+  }
+  const auto *codec = avcodec_find_encoder_by_name("hevc_nvenc");
+  ASSERT_NE(codec, nullptr);
+  auto *context = avcodec_alloc_context3(codec);
+  auto *frame = av_frame_alloc();
+  auto *packet = av_packet_alloc();
+  const auto cleanup = util::fail_guard([&] {
+    av_packet_free(&packet);
+    av_frame_free(&frame);
+    avcodec_free_context(&context);
+  });
+  ASSERT_NE(context, nullptr);
+  ASSERT_NE(frame, nullptr);
+  ASSERT_NE(packet, nullptr);
+  context->width = frame->width = 1440;
+  context->height = frame->height = 3120;
+  context->pix_fmt = AV_PIX_FMT_NV12;
+  frame->format = AV_PIX_FMT_NV12;
+  context->time_base = AVRational {1, 60};
+  context->framerate = AVRational {60, 1};
+  context->bit_rate = 20000000;
+  ASSERT_GE(av_opt_set(context->priv_data, "preset", "p1", 0), 0);
+  ASSERT_GE(av_opt_set(context->priv_data, "tune", "ull", 0), 0);
+  ASSERT_GE(avcodec_open2(context, codec, nullptr), 0);
+  ASSERT_GE(av_frame_get_buffer(frame, 32), 0);
+  ptrdiff_t linesizes[4] {frame->linesize[0], frame->linesize[1], frame->linesize[2], frame->linesize[3]};
+  ASSERT_GE(av_image_fill_black(frame->data, linesizes, AV_PIX_FMT_NV12, AVCOL_RANGE_MPEG, 1440, 3120), 0);
+  ASSERT_GE(avcodec_send_frame(context, frame), 0);
+  ASSERT_GE(avcodec_send_frame(context, nullptr), 0);
+  ASSERT_GE(avcodec_receive_packet(context, packet), 0);
+  EXPECT_GT(packet->size, 0);
+  EXPECT_EQ(context->width, 1440);
+  EXPECT_EQ(context->height, 3120);
+}
+#endif
 
 TEST(KwinVirtualOutputTest, SupportsLaptopAndFractionalRefreshRates) {
   const auto mode = kwin::virtual_mode(true, true, 2880, 1800, 59.94, 200);
@@ -87,6 +305,7 @@ TEST_P(KwinVirtualOutputLiveTest, CapturesNativeClientFrameOverPipeWire) {
   });
   config::video.capture = "kwin";
   config::video.virtual_display = true;
+  config::video.virtual_display_mode = "extend";  // Existing opt-in live tests never disable physical outputs.
   const auto &mode = GetParam();
   config::video.virtual_display_scale = mode.scale;
   const auto platform = platf::init();
@@ -125,6 +344,6 @@ TEST_P(KwinVirtualOutputLiveTest, CapturesNativeClientFrameOverPipeWire) {
 INSTANTIATE_TEST_SUITE_P(
   NativeClients,
   KwinVirtualOutputLiveTest,
-  ::testing::Values(virtual_live_case_t {3120, 1440, 60, 0, 100}, virtual_live_case_t {2880, 1800, 90, 0, 150}, virtual_live_case_t {2400, 1600, 60, 5994, 200})
+  ::testing::Values(virtual_live_case_t {3120, 1440, 60, 0, 100}, virtual_live_case_t {1440, 3120, 60, 0, 100}, virtual_live_case_t {2880, 1800, 90, 0, 150}, virtual_live_case_t {2400, 1600, 60, 5994, 200})
 );
 #endif

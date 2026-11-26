@@ -280,7 +280,17 @@ if(PIPEWIRE_FOUND AND WAYLAND_FOUND AND ${SUNSHINE_ENABLE_KWIN})
     add_compile_definitions(SUNSHINE_BUILD_KWIN)
     GEN_WAYLAND("${CMAKE_SOURCE_DIR}/third-party/plasma-wayland-protocols/src/protocols" "" kde-output-order-v1)
     GEN_WAYLAND("${CMAKE_SOURCE_DIR}/third-party/plasma-wayland-protocols/src/protocols" "" zkde-screencast-unstable-v1)
+    GEN_WAYLAND("${CMAKE_SOURCE_DIR}/third-party/plasma-wayland-protocols/src/protocols" "" kde-output-device-v2)
+    GEN_WAYLAND("${CMAKE_SOURCE_DIR}/third-party/plasma-wayland-protocols/src/protocols" "" kde-output-management-v2)
+    add_executable(sunshine-kwin-output
+            "${CMAKE_SOURCE_DIR}/tools/kwin_output.cpp"
+            "${CMAKE_BINARY_DIR}/generated-src/kde-output-device-v2.c"
+            "${CMAKE_BINARY_DIR}/generated-src/kde-output-management-v2.c")
+    target_include_directories(sunshine-kwin-output PRIVATE "${CMAKE_BINARY_DIR}/generated-src")
+    target_link_libraries(sunshine-kwin-output PRIVATE ${WAYLAND_LIBRARIES})
+    list(APPEND SUNSHINE_TARGET_DEPENDENCIES sunshine-kwin-output)
     list(APPEND PLATFORM_TARGET_FILES
+            "${CMAKE_SOURCE_DIR}/src/platform/linux/kwin_exclusive.cpp"
             "${CMAKE_SOURCE_DIR}/src/platform/linux/kwingrab.cpp")
 elseif(${SUNSHINE_ENABLE_KWIN} AND NOT WAYLAND_FOUND)
     message(FATAL_ERROR "SUNSHINE_ENABLE_KWIN requires SUNSHINE_ENABLE_WAYLAND — KWin capture disabled")

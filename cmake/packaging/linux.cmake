@@ -1,4 +1,7 @@
 # linux specific packaging
+if(KWIN_FOUND)
+    install(TARGETS sunshine-kwin-output DESTINATION "${SUNSHINE_ASSETS_DIR}")
+endif()
 
 install(DIRECTORY "${SUNSHINE_SOURCE_ASSETS_DIR}/linux/assets/"
         DESTINATION "${SUNSHINE_ASSETS_DIR}")
