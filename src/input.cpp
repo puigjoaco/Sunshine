@@ -2333,6 +2333,14 @@ namespace input {
       }
     }
 
+    dispatch_input_task([]() {
+      if (platf_input) {
+        reset_mouse_buttons();
+        reset_keyboard_keys();
+        platf::virtualhid::get_input_context(platf_input).begin_session();
+      }
+    });
+
     if (resumed) {
       dispatch_input_task([input, mail = std::move(mail)]() {
         rebind_input(input, mail);
@@ -2390,6 +2398,10 @@ namespace input {
       task_pool.cancel(key_press_repeat_id);
       key_press_repeat_id = nullptr;
       key_press.clear();
+    }
+
+    void dispatch_mouse_packet(std::shared_ptr<input_t> &input) {
+      passthrough_next_message(input);
     }
 
     void release_held_keys() {

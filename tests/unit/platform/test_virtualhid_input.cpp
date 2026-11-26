@@ -947,3 +947,33 @@ TEST_F(VirtualHidDeviceTest, PlatformWrappersForwardToVirtualHidContext) {
   platf::pen_update(platform_client.get(), viewport, {LI_TOUCH_EVENT_HOVER, LI_TOOL_TYPE_PEN, 0, LI_TILT_UNKNOWN, LI_ROT_UNKNOWN, 0.25F, 0.5F, 0.5F, 0.0F, 0.0F});
   EXPECT_EQ(platform_client_context.pen->last_submitted_tool().tool, lvh::PenToolType::pen);
 }
+
+TEST_F(VirtualHidDeviceTest, KeepsFallbackKeysOnTheirSourceUntilReleaseAndClearsThemOnReplacement) {
+  platf::virtualhid::keyboard_update(*context(), 0xA3, false, 0);
+  EXPECT_EQ(context()->held_keys, (std::set<std::uint16_t> {0xA3}));
+  platf::virtualhid::keyboard_update(*context(), 0x41, false, 0);
+  EXPECT_EQ(context()->held_keys.size(), 2U);
+  platf::virtualhid::keyboard_update(*context(), 0xA3, true, 0);
+  EXPECT_EQ(context()->held_keys, (std::set<std::uint16_t> {0x41}));
+  platf::virtualhid::keyboard_update(*context(), 0x5B, false, 0);
+  context()->refresh_keyboard();
+  EXPECT_TRUE(context()->held_keys.empty());
+}
+
+#ifdef SUNSHINE_BUILD_KWIN
+TEST_F(VirtualHidDeviceTest, KwinPlainScrollPreservesValue120AndModifiedScrollUsesTheSharedSource) {
+  const char *runtime = std::getenv("XDG_RUNTIME_DIR");
+  if (!runtime || std::string_view(runtime).find("/sunshine-mouse-") == std::string_view::npos) GTEST_SKIP() << "Private KWin harness only";
+  context()->kwin_keyboard = std::make_unique<kwin::keyboard>();
+  ASSERT_EQ(context()->kwin_keyboard->start(), kwin::text_result::sent);
+  platf::virtualhid::scroll(*context(), 1);
+  EXPECT_EQ(context()->mouse->last_submitted_event().high_resolution_scroll, 1);
+  platf::virtualhid::hscroll(*context(), -1);
+  EXPECT_EQ(context()->mouse->last_submitted_event().high_resolution_scroll, -1);
+  const auto before = context()->mouse->submit_count();
+  platf::virtualhid::keyboard_update(*context(), 0xA3, false, 0);
+  platf::virtualhid::scroll(*context(), 1);
+  platf::virtualhid::keyboard_update(*context(), 0xA3, true, 0);
+  EXPECT_EQ(context()->mouse->submit_count(), before);
+}
+#endif

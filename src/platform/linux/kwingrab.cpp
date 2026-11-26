@@ -39,6 +39,7 @@
 #include "cuda.h"
 #include "graphics.h"
 #include "kwin_exclusive.h"
+#include "kwin_permission.h"
 #include "kwin_virtual.h"
 #include "pipewire.cpp"
 #include "src/client_display.h"
@@ -53,7 +54,7 @@ namespace kwin {
    * KWin Wayland ScreenCast permissions
    *
    * To have access to zkde_screencast_unstable_v1 KWin checks for a .desktop file with
-   * X-KDE-Wayland-Interfaces=zkde_screencast_unstable_v1 and the current executable name
+   * X-KDE-Wayland-Interfaces=zkde_screencast_unstable_v1,org_kde_kwin_fake_input and the current executable name
    * in the Exec= parameter.
    */
   class screencast_permission_helper_t {
@@ -106,6 +107,7 @@ namespace kwin {
         initialized = true;
         return;
       }
+      bool upgraded = false;
       auto user_filepathprefix = (std::filesystem::path(user_applications) / filenameprefix).string();
       for (const auto &path : std::filesystem::directory_iterator(user_applications)) {
         // List existing files for prefix and check if they contain this executable or remove them
@@ -113,8 +115,20 @@ namespace kwin {
         if (entry.starts_with(user_filepathprefix)) {
           auto entry_executablepath = get_executable_from_desktop_file(entry);
           if (!entry_executablepath.empty() && entry_executablepath == executablepath) {
-            // This entry is exactly the one we need
-            BOOST_LOG(debug) << "[kwingrab] Ignoring current temporary KWin wayland permission file: "sv << entry;
+            std::ifstream source(entry);
+            std::string content {std::istreambuf_iterator<char>(source), std::istreambuf_iterator<char>()};
+            if (!complete_permission_interfaces(content)) {
+              source.close();
+              std::ofstream target(entry);
+              target << upgrade_permission_interfaces(content);
+              target.close();
+              if (!target) {
+                BOOST_LOG(warning) << "[kwingrab] Cannot upgrade KWin permission file: "sv << entry;
+                continue;
+              }
+              upgraded = true;
+              BOOST_LOG(info) << "[kwingrab] Upgraded KWin permission interfaces: "sv << entry;
+            }
             create_file = false;
             continue;
           }
@@ -139,7 +153,7 @@ namespace kwin {
         if (filestream.is_open()) {
           filestream << "[Desktop Entry]" << std::endl
                      << "Exec=" << executablepath << std::endl
-                     << "X-KDE-Wayland-Interfaces=zkde_screencast_unstable_v1" << std::endl
+                     << "X-KDE-Wayland-Interfaces=zkde_screencast_unstable_v1,org_kde_kwin_fake_input" << std::endl
                      << "Type=Application" << std::endl
                      << "Name="sv << PROJECT_FQDN << "-kwin-wayland-permission" << std::endl
                      << "Comment=Sunshine KWin screencast permission" << std::endl
@@ -153,6 +167,7 @@ namespace kwin {
         }
       }
 
+      if (upgraded && !create_file) std::this_thread::sleep_for(std::chrono::milliseconds(3000));
       initialized = true;
     }
 
@@ -241,7 +256,9 @@ namespace kwin {
         std::string filename = std::format("{0}{1}applications{1}{2}.desktop", dir, boost::filesystem::path::preferred_separator, filenameprefix);
         if (std::filesystem::exists(filename)) {
           auto file_executablepath = get_executable_from_desktop_file(filename);
-          if (file_executablepath == executablepath) {
+          std::ifstream source(filename);
+          std::string content {std::istreambuf_iterator<char>(source), std::istreambuf_iterator<char>()};
+          if (file_executablepath == executablepath && complete_permission_interfaces(content)) {
             BOOST_LOG(info) << "[kwingrab] Found matching system KWin desktop permission file: "sv << filename;
             return true;
           }

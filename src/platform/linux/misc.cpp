@@ -1228,6 +1228,10 @@ namespace platf {
   std::vector<std::string> kwin_display_names();
   std::shared_ptr<display_t> kwin_display(mem_type_e hwdevice_type, const std::string &display_name, const video::config_t &config);
 
+  /**
+   * @brief Check whether KWin capture is usable in the current Wayland session.
+   * @return True when KWin is available and exposes at least one capture display.
+   */
   bool verify_kwin() {
     // Note: The separate kwin_available check is necessary because with CAP_SYS_ADMIN kwin_display_names is never empty during startup
     return window_system == window_system_e::WAYLAND && kwin_available() && !kwin_display_names().empty();

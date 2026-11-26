@@ -9,12 +9,16 @@
 // standard includes
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <limits>
 #include <memory>
 #include <string>
 #include <vector>
+
+// lib includes
+#include <nlohmann/json.hpp>
 
 // moonlight-common-c includes
 extern "C" {
@@ -23,6 +27,7 @@ extern "C" {
 
 // local includes
 #include "src/config.h"
+#include "src/globals.h"
 #include "src/input.h"
 #include "src/platform/virtualhid_input.h"
 #include "src/utility.h"
@@ -306,6 +311,66 @@ TEST_F(InputGamepadSessionTest, PositionsVirtualOutputPointerInFullLogicalDeskto
   EXPECT_EQ(event.y, 720);
   EXPECT_EQ(event.width, 8240);
   EXPECT_EQ(event.height, 1440);
+}
+
+TEST_F(InputGamepadSessionTest, MapsMousePacketsAcrossOrientationScaleAndDesktopOffset) {
+  ASSERT_FALSE(task_pool.running());
+  config::input.mouse = true;
+  int case_index = 0;
+  for (const auto &[width, height] : {std::pair {1440, 3120}, std::pair {3120, 1440}}) {
+    for (const float scale : {1.0f, 2.5f}) {
+      for (const int offset : {0, 1280}) {
+        const int logical_width = std::lround(width / scale);
+        const int logical_height = std::lround(height / scale);
+        const int desktop_width = offset + logical_width;
+        const auto mailbox = std::make_shared<safe::mail_raw_t>();
+        auto state = input::alloc(mailbox, "mouse-mapping-" + std::to_string(case_index));
+        mailbox->event<input::touch_port_t>(mail::touch_port)->raise(input::touch_port_t {
+          {offset, 0, width, height, logical_width, logical_height},
+          offset + width, height, 0, 0, 1.0f, scale, desktop_width, logical_height
+        });
+        nlohmann::json measurements = nlohmann::json::array();
+        for (const auto &[x, y] : {std::pair {0, 0}, std::pair {width / 2, height / 2}, std::pair {width, height}, std::pair {width / 2 + 100, height / 2 + 100}}) {
+          NV_ABS_MOUSE_MOVE_PACKET packet {};
+          packet.header.size = util::endian::big<std::uint32_t>(sizeof(packet) - sizeof(packet.header.size));
+          packet.header.magic = util::endian::little<std::uint32_t>(MOUSE_MOVE_ABS_MAGIC);
+          packet.x = util::endian::big<std::int16_t>(x);
+          packet.y = util::endian::big<std::int16_t>(y);
+          packet.width = util::endian::big<std::int16_t>(width);
+          packet.height = util::endian::big<std::int16_t>(height);
+          std::vector<std::uint8_t> bytes(sizeof(packet));
+          std::memcpy(bytes.data(), &packet, sizeof(packet));
+          input::passthrough(state, std::move(bytes));
+          input::testing::dispatch_mouse_packet(state);
+          const auto event = context().mouse->last_submitted_event();
+          EXPECT_EQ(event.kind, lvh::MouseEventKind::absolute_motion);
+          EXPECT_EQ(event.x, offset + std::lround(x / scale));
+          EXPECT_EQ(event.y, std::lround(y / scale));
+          EXPECT_EQ(event.width, desktop_width);
+          EXPECT_EQ(event.height, logical_height);
+          measurements.push_back({event.x, event.y});
+        }
+        RecordProperty("mouse_case_" + std::to_string(case_index++), nlohmann::json {
+          {"pixels", {width, height}}, {"scale", scale}, {"offset", offset},
+          {"desktop", {desktop_width, logical_height}}, {"absolute", measurements}
+        }.dump());
+
+        NV_REL_MOUSE_MOVE_PACKET relative {};
+        relative.header.size = util::endian::big<std::uint32_t>(sizeof(relative) - sizeof(relative.header.size));
+        relative.header.magic = util::endian::little<std::uint32_t>(MOUSE_MOVE_REL_MAGIC_GEN5);
+        relative.deltaX = util::endian::big<std::int16_t>(100);
+        relative.deltaY = util::endian::big<std::int16_t>(-100);
+        std::vector<std::uint8_t> bytes(sizeof(relative));
+        std::memcpy(bytes.data(), &relative, sizeof(relative));
+        input::passthrough(state, std::move(bytes));
+        input::testing::dispatch_mouse_packet(state);
+        const auto event = context().mouse->last_submitted_event();
+        EXPECT_EQ(event.kind, lvh::MouseEventKind::relative_motion);
+        EXPECT_EQ(event.x, 100);
+        EXPECT_EQ(event.y, -100);
+      }
+    }
+  }
 }
 
 TEST_F(InputGamepadSessionTest, IgnoresPointerPositionBeforeDesktopBoundsAreKnown) {

@@ -17,6 +17,9 @@
 
 // local includes
 #include "src/platform/common.h"
+#ifdef SUNSHINE_BUILD_KWIN
+  #include "linux/kwin_text.h"
+#endif
 
 namespace platf::virtualhid {
 
@@ -46,7 +49,14 @@ namespace platf::virtualhid {
      */
     void refresh_mouse();
 
+    /** @brief Select one keyboard/pointer backend at stream start, releasing the previous source. */
+    void begin_session();
+
     std::unique_ptr<lvh::Runtime> runtime;  ///< libvirtualhid runtime.
+    std::set<std::uint16_t> held_keys; ///< Keys held on the fallback device for release at session boundaries.
+#ifdef SUNSHINE_BUILD_KWIN
+    std::unique_ptr<kwin::keyboard> kwin_keyboard; ///< Pinned stream source for keys, text, pointer motion and buttons.
+#endif
     std::unique_ptr<lvh::Keyboard> keyboard;  ///< Shared virtual keyboard.
     std::unique_ptr<lvh::Mouse> mouse;  ///< Shared virtual mouse.
     std::vector<std::shared_ptr<struct gamepad_context_t>> gamepads {static_cast<std::size_t>(MAX_GAMEPADS)};  ///< Virtual gamepad slots.

@@ -17,7 +17,10 @@ namespace kwin {
    */
   class exclusive_t {
   public:
-    /** @brief Get the lease whose destructor restores immediately on normal exit. */
+    /**
+     * @brief Get the lease whose destructor restores immediately on normal exit.
+     * @return Process-wide exclusive-output lease.
+     */
     static exclusive_t &instance();
     /** @brief Restore and join the grace worker before disconnecting the guardian. */
     ~exclusive_t();
@@ -34,7 +37,10 @@ namespace kwin {
      * @return True after the guardian verifies the sole enabled output.
      */
     bool begin(const void *identity, const std::string &name);
-    /** @brief Claim the parked output before its deadline, cancelling the timer. */
+    /**
+     * @brief Claim the parked output before its deadline, cancelling the timer.
+     * @return Retained screencast output, or null if no parked output can be claimed.
+     */
     std::shared_ptr<void> resume();
     /**
      * @brief Transfer output ownership to the reconnect grace worker.

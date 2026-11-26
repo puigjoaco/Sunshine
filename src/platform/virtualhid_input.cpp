@@ -22,6 +22,9 @@
 #include "src/config.h"
 #include "src/logging.h"
 #include "virtualhid_input.h"
+#ifdef SUNSHINE_BUILD_KWIN
+  #include "linux/kwin_text.h"
+#endif
 
 using namespace std::literals;
 
@@ -51,6 +54,7 @@ namespace platf::virtualhid {
   };
 
   namespace {
+    std::mutex keyboard_mutex; ///< Serializes the shared keyboard and its owned modifier snapshot.
 
     /**
      * @brief Gamepad profile exposed through Sunshine config.
@@ -458,6 +462,14 @@ namespace platf::virtualhid {
   }
 
   void input_context_t::refresh_keyboard() {
+    const std::lock_guard lock {keyboard_mutex};
+#ifdef SUNSHINE_BUILD_KWIN
+    if (kwin_keyboard) kwin_keyboard->release_all(); // Refresh must not select a different source mid-stream.
+#endif
+    if (keyboard) {
+      for (auto key : held_keys) log_failure("release old keyboard key"sv, keyboard->submit(keyboard_event(key, true, 0)));
+    }
+    held_keys.clear();
     keyboard.reset();
     if (!runtime || !runtime->capabilities().supports_keyboard) {
       return;
@@ -472,6 +484,21 @@ namespace platf::virtualhid {
     } else {
       log_failure("create libvirtualhid keyboard"sv, created.status);
     }
+  }
+
+  void input_context_t::begin_session() {
+    const std::lock_guard lock {keyboard_mutex};
+#ifdef SUNSHINE_BUILD_KWIN
+    kwin_keyboard.reset();
+    if (runtime && runtime->backend_kind() != lvh::BackendKind::fake) {
+      auto source = std::make_unique<kwin::keyboard>();
+      if (source->start() == kwin::text_result::sent) kwin_keyboard = std::move(source);
+    }
+#endif
+    if (keyboard) {
+      for (auto key : held_keys) log_failure("release old session key"sv, keyboard->submit(keyboard_event(key, true, 0)));
+    }
+    held_keys.clear();
   }
 
   void input_context_t::refresh_mouse() {
@@ -794,12 +821,28 @@ namespace platf::virtualhid {
   }
 
   void move_mouse(input_context_t &context, int delta_x, int delta_y) {
+    const std::lock_guard lock {keyboard_mutex};
+#ifdef SUNSHINE_BUILD_KWIN
+    if (context.kwin_keyboard) {
+      if (context.kwin_keyboard->motion(delta_x, delta_y, false) != kwin::text_result::sent) BOOST_LOG(warning) << "KWin relative motion failed"sv;
+      return;
+    }
+#endif
     if (context.mouse) {
       log_failure("submit libvirtualhid mouse movement"sv, context.mouse->move_relative(delta_x, delta_y));
     }
   }
 
   void abs_mouse(input_context_t &context, const touch_port_t &touch_port, float x, float y) {
+    const std::lock_guard lock {keyboard_mutex};
+#ifdef SUNSHINE_BUILD_KWIN
+    if (context.kwin_keyboard) {
+      // input.cpp already mapped these to global logical coordinates, including output offset/scale.
+      // Keep the fallback's integer rounding; never normalize them to the full desktop again.
+      if (context.kwin_keyboard->motion(std::lround(x), std::lround(y), true) != kwin::text_result::sent) BOOST_LOG(warning) << "KWin absolute motion failed"sv;
+      return;
+    }
+#endif
     if (context.mouse) {
       log_failure(
         "submit libvirtualhid absolute mouse movement"sv,
@@ -814,6 +857,13 @@ namespace platf::virtualhid {
   }
 
   void button_mouse(input_context_t &context, int button, bool release) {
+    const std::lock_guard lock {keyboard_mutex};
+#ifdef SUNSHINE_BUILD_KWIN
+    if (context.kwin_keyboard) {
+      if (context.kwin_keyboard->button(button, !release) != kwin::text_result::sent) BOOST_LOG(warning) << "KWin pointer button failed"sv;
+      return;
+    }
+#endif
     if (context.mouse) {
       const auto converted = mouse_button(button);
       if (!converted) {
@@ -825,25 +875,56 @@ namespace platf::virtualhid {
   }
 
   void scroll(input_context_t &context, int high_res_distance) {
+    const std::lock_guard lock {keyboard_mutex};
+#ifdef SUNSHINE_BUILD_KWIN
+    if (context.kwin_keyboard && context.kwin_keyboard->scroll(high_res_distance, false) != kwin::text_result::unavailable) return;
+#endif
     if (context.mouse) {
       log_failure("submit libvirtualhid vertical scroll"sv, context.mouse->vertical_scroll(high_res_distance));
     }
   }
 
   void hscroll(input_context_t &context, int high_res_distance) {
+    const std::lock_guard lock {keyboard_mutex};
+#ifdef SUNSHINE_BUILD_KWIN
+    if (context.kwin_keyboard && context.kwin_keyboard->scroll(high_res_distance, true) != kwin::text_result::unavailable) return;
+#endif
     if (context.mouse) {
       log_failure("submit libvirtualhid horizontal scroll"sv, context.mouse->horizontal_scroll(high_res_distance));
     }
   }
 
   void keyboard_update(input_context_t &context, std::uint16_t modcode, bool release, std::uint8_t flags) {
+    const std::lock_guard lock {keyboard_mutex};
+#ifdef SUNSHINE_BUILD_KWIN
+    // Selected once at stream start. Connection failure never promotes/replays onto uinput.
+    if (context.kwin_keyboard) {
+      const auto result = context.kwin_keyboard->key(modcode, !release);
+      if (result != kwin::text_result::sent) BOOST_LOG(warning) << "KWin keyboard event failed; not replaying on another source"sv;
+      return;
+    }
+#endif
     if (context.keyboard) {
-      log_failure("submit libvirtualhid keyboard input"sv, context.keyboard->submit(keyboard_event(modcode, release, flags)));
+      const auto status = context.keyboard->submit(keyboard_event(modcode, release, flags));
+      if (status.ok()) {
+        if (release) context.held_keys.erase(modcode);
+        else context.held_keys.insert(modcode);
+      }
+      log_failure("submit libvirtualhid keyboard input"sv, status);
     }
   }
 
   void unicode(input_context_t &context, const char *utf8, int size) {
-    if (context.keyboard && utf8 && size > 0) {
+    const std::lock_guard lock {keyboard_mutex};
+    if (!utf8 || size <= 0) return;
+#ifdef SUNSHINE_BUILD_KWIN
+    if (context.kwin_keyboard) {
+      const auto result = context.kwin_keyboard->text(std::string_view {utf8, static_cast<std::size_t>(size)});
+      if (result != kwin::text_result::sent) BOOST_LOG(warning) << "KWin text injection failed; not retrying a possibly partial commit"sv;
+      return;
+    }
+#endif
+    if (context.keyboard) {
       log_failure("submit libvirtualhid text input"sv, context.keyboard->type_text({.text = std::string {utf8, static_cast<std::size_t>(size)}}));
     }
   }

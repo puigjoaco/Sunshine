@@ -386,6 +386,47 @@ permissions on the disk.
 ### Stuttering
 If you experience stuttering using NVIDIA, try disabling `vsync:fast` in the NVIDIA Control Panel.
 
+### Unicode text on KWin
+
+KWin with `org_kde_kwin_fake_input` version 6 receives remote text as balanced Unicode keysym
+strokes. Sunshine's executable must be authorized for `org_kde_kwin_fake_input` in its
+`X-KDE-Wayland-Interfaces` desktop entry, alongside the screencast interface. This path works
+in Qt and GTK applications without an input method or a trailing Return. It restores the active
+layout group, Caps Lock, and Sunshine-owned modifiers after the injection.
+
+Modifiers physically held at the PC are an accepted limitation. KWin's fake-input protocol
+cannot release or restore keys owned by another input device, and exposes no left/right
+physical-key snapshot. Release physical Shift/Ctrl/Alt/Meta before entering Unicode text.
+Sunshine never reads physical input devices or synthesizes replacement modifier keys.
+The opt-in `SUNSHINE_TEXT_PROBE_MODIFIERS=1` nested check reproduces this limitation; it is
+separate from the default passing suite.
+
+Other Linux backends retain the application-dependent Ctrl+Shift+U fallback. Its terminator
+is Space rather than Return, so an application that does not implement Unicode hex input
+cannot accidentally submit a form or execute a shell command through that terminator.
+
+At stream start, Sunshine selects either KWin fake-input or the fallback input backend
+and pins that choice until the stream ends. A failed connection is never promoted to a
+different device mid-stream. Keyboard positions, modifiers, text, pointer motion and all
+five mouse buttons share the same ordered fake-input connection. Absolute coordinates
+retain the stream's global logical mapping, including output scale and desktop offset.
+Wayland roundtrips acknowledge keys and buttons before later events. Text restores the
+layout group and all owned held keys, including ordinary keys and Right Alt (AltGr).
+
+Plain scrolling stays on uinput to preserve wheel and high-resolution value120 metadata.
+A fake-input roundtrip finishes earlier motion, buttons and keys before each uinput scroll.
+If an owned modifier is held, scrolling instead uses fake-input's continuous axis on the
+same connection, preserving Ctrl/Shift-scroll ordering at the cost of wheel/value120
+metadata. Android one-shot modifiers wrap scrolling just as they wrap clicks. The remaining
+race from an asynchronous plain uinput scroll to a following fake-input click is accepted;
+there is no acknowledgment for that independent uinput queue.
+
+The nested suite checks 100 delayed mixed key/text lines, repeated Ctrl-click/Ctrl-scroll,
+held-key repeat, release on destruction, and portrait/landscape motion at 1x and 2.5x scale.
+
+The isolated check is `python3 tests/integration/linux/kwin_text_nested.py`; it builds small
+Qt and GTK text clients and never injects into the user's shared input seat.
+
 <div class="section_buttons">
 
 | Previous      |                    Next |

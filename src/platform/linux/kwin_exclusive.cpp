@@ -16,6 +16,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+/** @brief Process environment inherited by the independent recovery guardian. */
 extern char **environ;
 
 using namespace std::chrono_literals;

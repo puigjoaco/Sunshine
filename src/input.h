@@ -152,6 +152,12 @@ namespace input {
     void send_keyboard_packet(std::shared_ptr<input_t> &input, std::uint16_t key_code, std::uint8_t modifiers, std::uint8_t flags, bool release);
 
     /**
+     * @brief Process a queued mouse batch synchronously through the production dispatcher.
+     * @param input Test input with a fake platform backend and a stopped task pool.
+     */
+    void dispatch_mouse_packet(std::shared_ptr<input_t> &input);
+
+    /**
      * @brief Forget every key Sunshine tracks as pressed and cancel any pending key repeat.
      */
     void reset_keyboard_state();
