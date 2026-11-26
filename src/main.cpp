@@ -38,6 +38,7 @@
 #include "httpcommon.h"
 #include "logging.h"
 #include "main.h"
+#include "microphone.h"
 #include "nvhttp.h"
 #include "process.h"
 #include "system_tray.h"
@@ -189,6 +190,16 @@ int main(int argc, char *argv[]) {
     return 1;
   }
 #endif
+
+  // The guardian requires no privileged workers, network listeners, or app startup.
+  if (argc == 3 && std::string_view(argv[1]) == "--microphone-guard") {
+#ifdef __linux__
+    if (platf::has_elevated_privileges(true)) {
+      platf::drop_elevated_privileges(true);
+    }
+#endif
+    return microphone::guard(std::string_view(argv[2]) == "3" ? 3 : -1);
+  }
 
 #ifdef __APPLE__
   // Bundle assets are referenced relative to the executable

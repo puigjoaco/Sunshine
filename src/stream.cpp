@@ -28,6 +28,7 @@ extern "C" {
 #include "globals.h"
 #include "input.h"
 #include "logging.h"
+#include "microphone.h"
 #include "network.h"
 #include "platform/common.h"
 #include "process.h"
@@ -487,6 +488,8 @@ namespace stream {
    * @brief Runtime state for one audio/video streaming session.
    */
   struct session_t {
+    std::unique_ptr<microphone::receiver_t> microphone;  ///< Session-owned reverse audio receiver.
+    std::optional<uint32_t> microphone_stop_sequence;  ///< Replay boundary for stops received before the receiver exists.
     config_t config;  ///< Stream or encoder configuration captured for the worker.
 
     safe::mail_t mail;  ///< Mailbox used to distribute packets and lifecycle events.
@@ -1235,15 +1238,42 @@ namespace stream {
       input::passthrough(session->input, std::move(plaintext));
     });
 
+    server->map(microphone::packet_type, [](session_t *session, const std::string_view &payload) {
+      // Never accept cleartext audio, even on a legacy/unnegotiated control stream.
+      if (session->config.controlProtocolType != 13 || !(session->config.encryptionFlagsEnabled & SS_ENC_CONTROL_V2)) {
+        return;
+      }
+      auto frame = microphone::parse(payload);
+      if (!frame) {
+        return;
+      }
+      if (!session->microphone) {
+        if (session->microphone_stop_sequence && int32_t(frame->sequence - *session->microphone_stop_sequence) <= 0) {
+          return;
+        }
+        if (!frame->active) {
+          session->microphone_stop_sequence = frame->sequence;
+          return;
+        }
+        session->microphone = microphone::create();
+      }
+      if (session->microphone) {
+        session->microphone->push(std::move(*frame));
+      }
+    });
+
     server->map(packetTypes[IDX_ENCRYPTED], [server](session_t *session, const std::string_view &payload) {
       BOOST_LOG(verbose) << "type [IDX_ENCRYPTED]"sv;
 
+      if (payload.size() < 6) {
+        return;
+      }
       auto header = (control_encrypted_p) (payload.data() - 2);
 
       auto length = util::endian::little(header->length);
       auto seq = util::endian::little(header->seq);
 
-      if (length < (16 + 4 + 4)) {
+      if (length < (16 + 4 + 4) || length != payload.size() - 2) {
         BOOST_LOG(warning) << "Control: Runt packet"sv;
         return;
       }
@@ -1283,7 +1313,15 @@ namespace stream {
         return;
       }
 
-      auto type = *(std::uint16_t *) plaintext.data();
+      if (plaintext.size() < 4) {
+        return;
+      }
+      std::uint16_t wire_type;
+      std::memcpy(&wire_type, plaintext.data(), sizeof(wire_type));
+      auto type = util::endian::little(wire_type);
+      if (microphone::read_le(std::string_view(reinterpret_cast<const char *>(plaintext.data()), plaintext.size()), 2, 2) != plaintext.size() - 4) {
+        return;
+      }
       std::string_view next_payload {(char *) plaintext.data() + 4, plaintext.size() - 4};
 
       if (type == packetTypes[IDX_ENCRYPTED]) {
@@ -2232,6 +2270,7 @@ namespace stream {
       session.audioThread.join();
       BOOST_LOG(debug) << "Waiting for control to end..."sv;
       session.controlEnd.view();
+      session.microphone.reset();
       // Reset input on session stop to avoid stuck repeated keys
       BOOST_LOG(debug) << "Resetting Input..."sv;
       input::reset(session.input);
