@@ -22,6 +22,7 @@ extern "C" {
 #include <boost/bind.hpp>
 
 // local includes
+#include "camera.h"
 #include "microphone.h"
 #include "config.h"
 #include "globals.h"
@@ -927,6 +928,8 @@ namespace rtsp_stream {
 
     // Tell the client about our supported features
     ss << "a=x-ss-general.featureFlags:" << (uint32_t) platf::get_capabilities() << std::endl;
+
+    if (camera::available()) ss << "a=x-ss-camera.version:1" << std::endl;
 
     if (microphone::available()) ss << "a=x-ss-microphone.version:1" << std::endl;
 

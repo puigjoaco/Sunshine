@@ -26,6 +26,7 @@ extern "C" {
 #include "config.h"
 #include "display_device.h"
 #include "globals.h"
+#include "camera.h"
 #include "input.h"
 #include "logging.h"
 #include "microphone.h"
@@ -488,6 +489,8 @@ namespace stream {
    * @brief Runtime state for one audio/video streaming session.
    */
   struct session_t {
+    std::unique_ptr<camera::receiver_t> camera;  ///< Session-owned reverse camera receiver.
+    std::optional<uint32_t> camera_stop_sequence;  ///< Stop boundary before receiver creation.
     std::unique_ptr<microphone::receiver_t> microphone;  ///< Session-owned reverse audio receiver.
     std::optional<uint32_t> microphone_stop_sequence;  ///< Replay boundary for stops received before the receiver exists.
     config_t config;  ///< Stream or encoder configuration captured for the worker.
@@ -1236,6 +1239,29 @@ namespace stream {
       }
 
       input::passthrough(session->input, std::move(plaintext));
+    });
+
+    server->map(camera::packet_type, [](session_t *session, const std::string_view &payload) {
+      if (session->config.controlProtocolType != 13 || !(session->config.encryptionFlagsEnabled & SS_ENC_CONTROL_V2)) {
+        return;
+      }
+      auto chunk = camera::parse(payload);
+      if (!chunk) {
+        return;
+      }
+      if (!session->camera) {
+        if (session->camera_stop_sequence && int32_t(chunk->sequence - *session->camera_stop_sequence) <= 0) {
+          return;
+        }
+        if (chunk->stop) {
+          session->camera_stop_sequence = chunk->sequence;
+          return;
+        }
+        session->camera = camera::create();
+      }
+      if (session->camera) {
+        session->camera->push(std::move(*chunk));
+      }
     });
 
     server->map(microphone::packet_type, [](session_t *session, const std::string_view &payload) {
@@ -2271,6 +2297,7 @@ namespace stream {
       BOOST_LOG(debug) << "Waiting for control to end..."sv;
       session.controlEnd.view();
       session.microphone.reset();
+      session.camera.reset();
       // Reset input on session stop to avoid stuck repeated keys
       BOOST_LOG(debug) << "Resetting Input..."sv;
       input::reset(session.input);
