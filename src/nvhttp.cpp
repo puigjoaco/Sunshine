@@ -23,6 +23,7 @@
 #include <Simple-Web-Server/server_http.hpp>
 
 // local includes
+#include "client_display.h"
 #include "config.h"
 #include "display_device.h"
 #include "file_handler.h"
@@ -475,6 +476,7 @@ namespace nvhttp {
     std::copy(rikey.cbegin(), rikey.cend(), std::back_inserter(launch_session->gcm_key));
 
     launch_session->host_audio = host_audio;
+    launch_session->virtual_display_scale = client_display::parse_scale(get_arg(args, "virtualDisplayScale", ""));
     std::stringstream mode = std::stringstream(get_arg(args, "mode", "0x0x0"));
     // Split mode by the char "x", to populate width/height/fps
     int x = 0;

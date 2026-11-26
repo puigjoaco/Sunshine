@@ -41,6 +41,7 @@
 #include "kwin_exclusive.h"
 #include "kwin_virtual.h"
 #include "pipewire.cpp"
+#include "src/client_display.h"
 #include "src/config.h"
 #include "src/platform/common.h"
 #include "src/video.h"
@@ -469,7 +470,7 @@ namespace kwin {
      */
     int start_virtual(const video::config_t &config) {
       const auto fps = video::framerate_to_rational(config);
-      const auto mode = virtual_mode(config::video.virtual_display, config.client_stream, config.width, config.height, av_q2d(fps), config::video.virtual_display_scale);
+      const auto mode = virtual_mode(config::video.virtual_display, config.client_stream, config.width, config.height, av_q2d(fps), client_display::select_scale(config.virtual_display_scale, config::video.virtual_display_scale));
       if (!mode || !kde_screencast_v1_ || wl_proxy_get_version(reinterpret_cast<wl_proxy *>(kde_screencast_v1_)) < 2) {
         return -1;
       }
@@ -518,7 +519,7 @@ namespace kwin {
      */
     int configure_virtual(const video::config_t &config) {
       const auto fps = video::framerate_to_rational(config);
-      const auto mode = virtual_mode(config::video.virtual_display, config.client_stream, config.width, config.height, av_q2d(fps), config::video.virtual_display_scale);
+      const auto mode = virtual_mode(config::video.virtual_display, config.client_stream, config.width, config.height, av_q2d(fps), client_display::select_scale(config.virtual_display_scale, config::video.virtual_display_scale));
       if (!mode || !out_params) {
         return -1;
       }

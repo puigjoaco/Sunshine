@@ -102,7 +102,7 @@ def inner():
 
     def plasma():
         return json.loads(run("qdbus6", "org.kde.plasmashell", "/PlasmaShell", "org.kde.PlasmaShell.evaluateScript",
-                              "print(JSON.stringify({panels:panels().map(function(p){return p.screen;}).filter(function(s){return s>=0;}).sort(),desktops:desktops().map(function(d){return d.screen;}).filter(function(s){return s>=0;}).sort()}));"))
+                              "print(JSON.stringify({heights:panels().map(function(p){return p.height;}).sort(),panels:panels().map(function(p){return p.screen;}).filter(function(s){return s>=0;}).sort(),desktops:desktops().map(function(d){return d.screen;}).filter(function(s){return s>=0;}).sort()}));"))
 
     def plasma_exclusive():
         actual = plasma()
@@ -147,7 +147,7 @@ def inner():
         start("plasmashell", ["plasmashell", "--no-respawn"])
         wait(lambda: bus.name_has_owner("org.kde.plasmashell"), "private Plasma shell")
         run("qdbus6", "org.kde.plasmashell", "/PlasmaShell", "org.kde.PlasmaShell.evaluateScript",
-            "if(panels().length===0){var p=new Panel; p.location='bottom'; p.addWidget('org.kde.plasma.icontasks');}")
+            "if(panels().length===0){var p=new Panel; p.location='bottom'; p.addWidget('org.kde.plasma.icontasks');}panels().forEach(function(p){p.height=44;});")
         plasma_before = wait(lambda: plasma() if len(plasma()["desktops"]) == 2 and plasma()["panels"] else None, "two desktops and panel")
         app = directory / "windows.py"
         app.write_text('''from PyQt6.QtWidgets import QApplication, QWidget\napp=QApplication([])\nwindows=[]\nfor i in range(4):\n w=QWidget();w.setWindowTitle("exclusive-test-"+str(i));w.resize(500,350);w.show();windows.append(w)\napp.exec()\n''')
@@ -170,12 +170,16 @@ workspace.stackingOrder.filter(function(w) { return w.caption.indexOf('exclusive
         run("qdbus6", "org.kde.KWin", "/Scripting", "org.kde.kwin.Scripting.unloadScript", "exclusive-test-placement")
         first = start("landscape", [str(directory / "owner"), "Sunshine-test-1", "3120", "1440"])
         wait(lambda: any(o["name"] == "Virtual-Sunshine-test-1" for o in state()), "landscape owned output")
+        target = next(o for o in state() if o["name"] == "Virtual-Sunshine-test-1")
+        run("kscreen-doctor", f"output.{target['id']}.scale.2.5")
         p = guardian()
         command(p, {"action": "enter", "output": "Virtual-Sunshine-test-1"})
         assert mirrors("Virtual-Sunshine-test-1")
         wait(plasma_exclusive, "Plasma desktop and panels on sole virtual output")
+        assert plasma()["heights"] == [70], plasma()
         snapshot = Path(os.environ["XDG_STATE_HOME"]) / "sunshine/kwin-exclusive.json"
         snapshot_before = snapshot.read_text()
+        assert [panel["height"] for panel in json.loads(snapshot_before)["plasma"]["panels"]] == [44]
         assert len(json.loads(snapshot_before)["windows"]) >= 4
         assert len({w["output"] for w in json.loads(snapshot_before)["windows"]}) >= 2
         print("PASS: virtual primary, physical connectors remain enabled and mirror its UUID", flush=True)
@@ -189,6 +193,7 @@ workspace.stackingOrder.filter(function(w) { return w.caption.indexOf('exclusive
         assert mirrors("Virtual-Sunshine-test-1")
         command(p, {"action": "enter", "output": "Virtual-Sunshine-test-1"})
         assert snapshot.read_text() == snapshot_before, "reconnect overwrote original snapshot"
+        assert plasma()["heights"] == [70], plasma()
         assert mirrors("Virtual-Sunshine-test-1")
         target = next(o for o in state() if o["name"] == "Virtual-Sunshine-test-1")
         assert module.mode_of(target)["size"] == {"width": 1440, "height": 3120}
@@ -203,6 +208,7 @@ workspace.stackingOrder.filter(function(w) { return w.caption.indexOf('exclusive
         second = start("portrait", [str(directory / "owner"), "Sunshine-test-2", "1440", "3120"])
         wait(lambda: any(o["name"] == "Virtual-Sunshine-test-2" for o in state()), "portrait owned output")
         portrait = next(o for o in state() if o["name"] == "Virtual-Sunshine-test-2")
+        run("kscreen-doctor", f"output.{portrait['id']}.scale.2.5")
         assert module.mode_of(portrait)["size"] == {"width": 1440, "height": 3120}
         print("PASS: portrait 1440×3120 protocol-owned output", flush=True)
         # A closed parent lifeline simulates Sunshine dying without teardown.
@@ -210,6 +216,7 @@ workspace.stackingOrder.filter(function(w) { return w.caption.indexOf('exclusive
         p.stdin.close()
         assert p.wait(timeout=25) == 0, (directory / "guardian.log").read_text()
         assert module.restored(saved, state()) and not snapshot.exists()
+        assert plasma()["heights"] == plasma_before["heights"], plasma()
         print("PASS: parent crash/EOF restores immediately", flush=True)
         # Guardian killed with the service: ExecStopPost restores persisted data.
         p = guardian()
@@ -218,6 +225,7 @@ workspace.stackingOrder.filter(function(w) { return w.caption.indexOf('exclusive
         p.wait(timeout=5)
         run(sys.executable, str(HELPER), "restore")
         assert module.restored(saved, state()) and not snapshot.exists()
+        assert plasma()["heights"] == plasma_before["heights"], plasma()
         print("PASS: killed guardian recovered from disk by service/emergency restore", flush=True)
         # Real C++ lease: retains ownership, cancels on reconnect and expires after disconnect.
         p.stdin.close()
@@ -230,6 +238,7 @@ workspace.stackingOrder.filter(function(w) { return w.caption.indexOf('exclusive
                                 env=env, cwd=directory, capture_output=True, text=True, timeout=30)
         assert result.returncode == 0, result.stdout + result.stderr
         assert module.restored(saved, state()) and not snapshot.exists()
+        assert plasma()["heights"] == plasma_before["heights"], plasma()
         assert result.stdout.count("[       OK ]") == 3, result.stdout
         print("PASS: C++ grace/resume/expiration, killed-guardian recovery, immediate exit restore (3 tests)", flush=True)
         # Live manual restore while the helper still owns the lock.
@@ -237,6 +246,7 @@ workspace.stackingOrder.filter(function(w) { return w.caption.indexOf('exclusive
         command(p, {"action": "enter", "output": "Virtual-Sunshine-test-2"})
         run(sys.executable, str(HELPER), "restore")
         assert module.restored(saved, state()) and not snapshot.exists()
+        assert plasma()["heights"] == plasma_before["heights"], plasma()
         print("PASS: manual emergency restore reaches active guardian", flush=True)
         p.wait(timeout=10)
         # Simulate an older compositor/missing replication helper. Nothing powers
@@ -249,7 +259,7 @@ workspace.stackingOrder.filter(function(w) { return w.caption.indexOf('exclusive
         actual = state()
         assert all(o["enabled"] for o in actual)
         assert all(o.get("replicationSource", 0) == 0 for o in actual)
-        assert all(o["pos"]["x"] >= 1540 for o in actual if not module.owned(o))
+        assert all(o["pos"]["x"] >= 676 for o in actual if not module.owned(o))
         index = json.loads(run("qdbus6", "org.kde.plasmashell", "/PlasmaShell", "org.kde.PlasmaShell.evaluateScript",
                                "print(JSON.stringify(screenForConnector('Virtual-Sunshine-test-2')));"))
         assert plasma()["panels"] and all(s == index for s in plasma()["panels"])
@@ -259,13 +269,14 @@ workspace.stackingOrder.filter(function(w) { return w.caption.indexOf('exclusive
                 info = run("qdbus6", "org.kde.KWin", "/KWin", "org.kde.KWin.getWindowInfo", row["id"])
                 values = dict(line.split(": ", 1) for line in info.splitlines() if ": " in line)
                 if "x" in values:
-                    if float(values["x"]) < 0 or float(values["y"]) < 0 or float(values["x"]) + float(values["width"]) > 1442 or float(values["y"]) + float(values["height"]) > 3122:
+                    if float(values["x"]) < 0 or float(values["y"]) < 0 or float(values["x"]) + float(values["width"]) > 578 or float(values["y"]) + float(values["height"]) > 1250:
                         return False
             return True
         wait(windows_in_virtual_viewport, "all saved windows inside virtual viewport")
         print("PASS: unavailable-replication fallback keeps physical desktops on, panels/windows on virtual; physical wallpaper desktops remain", flush=True)
         command(p, {"action": "restore"})
         assert module.restored(saved, state()) and not snapshot.exists()
+        assert plasma()["heights"] == plasma_before["heights"], plasma()
         p.stdin.close()
         assert p.wait(timeout=10) == 0
         (directory / "sunshine-kwin-output.unavailable").rename(directory / "sunshine-kwin-output")
@@ -284,6 +295,10 @@ workspace.stackingOrder.filter(function(w) { return w.caption.indexOf('exclusive
         result = restore_cli()
         assert result.returncode != 0 and "Plasma restore incomplete" in result.stderr, result.stderr
         assert json.loads(snapshot.read_text())["output_recovery"] == "exact"
+        assert json.loads(snapshot.read_text())["panel_recovery"] == "exact"
+        assert plasma()["heights"] == plasma_before["heights"]
+        run("qdbus6", "org.kde.plasmashell", "/PlasmaShell", "org.kde.PlasmaShell.evaluateScript",
+            "panels().forEach(function(p){p.height=52;});")
         assert module.restored(saved, state())
         current = {o["name"]: o for o in state()}
         run("kscreen-doctor", f"output.{current[saved[0]['name']]['id']}.position.50,75",
@@ -292,6 +307,7 @@ workspace.stackingOrder.filter(function(w) { return w.caption.indexOf('exclusive
         result = restore_cli()
         assert result.returncode != 0 and snapshot.exists()
         assert module.restored(newer, state()), "Completed recovery overwrote a newer layout"
+        assert plasma()["heights"] == [52], "Completed panel recovery overwrote a later thickness choice"
         print("PASS: missing Plasma assignment retains state; repeated recovery preserves a newer output layout", flush=True)
         pending = json.loads(snapshot.read_text())
         pending["identity"]["boot"] = "previous-test-boot"
@@ -301,6 +317,9 @@ workspace.stackingOrder.filter(function(w) { return w.caption.indexOf('exclusive
         assert module.restored(newer, state())
         print("PASS: foreign-boot snapshot archived without changing the current layout", flush=True)
         module.doctor(module.restore_args(saved, state()))  # Reset only the private test fixture.
+        run("qdbus6", "org.kde.plasmashell", "/PlasmaShell", "org.kde.PlasmaShell.evaluateScript",
+            "panels().forEach(function(p){p.height=44;});")
+        print("PASS: touch panel 44→70 at 250%, disconnect/crash/emergency size restore and durable completed-stage retry", flush=True)
 
         # Remove a task-owned original connector while mirrored. Degraded
         # recovery must bring the desktop back to the remaining physical outputs.

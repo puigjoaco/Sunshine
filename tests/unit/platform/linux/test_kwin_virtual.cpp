@@ -18,6 +18,7 @@ extern "C" {
 }
 
 // local includes
+#include "src/client_display.h"
 #include "src/platform/linux/kwin_virtual.h"
 
 TEST(KwinVirtualOutputTest, EncoderProbeNeverCreatesAnOutput) {
@@ -116,6 +117,7 @@ TEST(KwinCaptureReconnectNestedTest, RetainsRealScreencastAndNegotiatesPortraitF
   display.reset();
   client.width = 1440;
   client.height = 3120;
+  client.virtual_display_scale = 250;
   display = platf::kwin_display(platf::mem_type_e::system, "", client);
   ASSERT_TRUE(display);
   auto portrait = frame(display, 1440, 3120);
@@ -131,6 +133,9 @@ TEST(KwinCaptureReconnectNestedTest, RetainsRealScreencastAndNegotiatesPortraitF
   ASSERT_TRUE(portrait.second);
   EXPECT_EQ(display->width, 1440);
   EXPECT_EQ(display->height, 3120);
+  EXPECT_EQ(display->logical_width, 576);
+  EXPECT_EQ(display->logical_height, 1248);
+  EXPECT_EQ(config::video.virtual_display_scale, 100);
   EXPECT_EQ(owned_names(), landscape);
   display.reset();
   const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
@@ -347,3 +352,26 @@ INSTANTIATE_TEST_SUITE_P(
   ::testing::Values(virtual_live_case_t {3120, 1440, 60, 0, 100}, virtual_live_case_t {1440, 3120, 60, 0, 100}, virtual_live_case_t {2880, 1800, 90, 0, 150}, virtual_live_case_t {2400, 1600, 60, 5994, 200})
 );
 #endif
+
+TEST(ClientDisplayScaleTest, ParsesOnlyBoundedIntegerPercentages) {
+  for (const auto value : {"100", "125", "250", "400"}) {
+    EXPECT_EQ(client_display::parse_scale(value), std::stoi(value));
+  }
+  for (const auto value : {"", "0", "99", "401", "-250", "+250", " 250", "250 ", "250x", "250.0", "999999999999999999999999"}) {
+    EXPECT_EQ(client_display::parse_scale(value), 0) << value;
+  }
+}
+
+TEST(ClientDisplayScaleTest, FallsBackWithoutLeakingBetweenClients) {
+  EXPECT_EQ(client_display::select_scale(250, 100), 250);
+  EXPECT_EQ(client_display::select_scale(0, 150), 150);
+  EXPECT_EQ(client_display::select_scale(99, 150), 150);
+  EXPECT_EQ(client_display::select_scale(401, 150), 150);
+  const auto portrait = kwin::virtual_mode(true, true, 1440, 3120, 60, client_display::select_scale(275, 100));
+  const auto landscape = kwin::virtual_mode(true, true, 3120, 1440, 60, client_display::select_scale(150, 100));
+  ASSERT_TRUE(portrait);
+  ASSERT_TRUE(landscape);
+  EXPECT_DOUBLE_EQ(portrait->scale, 2.75);
+  EXPECT_DOUBLE_EQ(landscape->scale, 1.5);
+  EXPECT_DOUBLE_EQ(kwin::virtual_mode(true, true, 1920, 1080, 60, client_display::select_scale(0, 100))->scale, 1.0);
+}

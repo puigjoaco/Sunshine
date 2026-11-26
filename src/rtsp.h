@@ -31,6 +31,7 @@ namespace rtsp_stream {
     int width;  ///< Frame or display width in pixels.
     int height;  ///< Frame or display height in pixels.
     int fps;  ///< Requested video frame rate.
+    int virtual_display_scale = 0;  ///< Optional per-client scale percentage; zero uses host configuration.
     int gcmap;  ///< Game controller mapping requested by the client.
     int appid;  ///< Application ID requested for launch or resume.
     int surround_info;  ///< Encoded GameStream surround-sound capability flags.

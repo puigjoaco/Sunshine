@@ -236,6 +236,51 @@ class ExclusiveTest(unittest.TestCase):
                 guardian.recover_desktop()
             plasma.assert_called_once_with("DP-1")
 
+    def test_touch_panel_height_follows_client_scale(self):
+        for scale, height in [(1, 44), (1.5, 44), (2, 56), (2.5, 70), (4, 112)]:
+            self.assertEqual(exclusive.touch_panel_height(scale), height)
+
+    def test_panel_height_restore_is_durable_and_not_replayed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.json"
+            state = recovery_state()
+            state["plasma"] = {"panels": [{"id": 7, "output": "DP-1", "height": 44}]}
+            exclusive.atomic_save(path, state)
+            guardian = exclusive.Guardian(path, None)
+            with patch.object(exclusive, "plasma_script", return_value=False):
+                with self.assertRaisesRegex(RuntimeError, "Panel thickness restore incomplete"):
+                    guardian.restore_panel_heights()
+            self.assertEqual(json.loads(path.read_text())["panel_recovery"], "restoring")
+            restarted = exclusive.Guardian(path, None)
+            with patch.object(exclusive, "plasma_script", return_value=True):
+                restarted.restore_panel_heights()
+            self.assertEqual(json.loads(path.read_text())["panel_recovery"], "exact")
+            restarted = exclusive.Guardian(path, None)
+            with patch.object(exclusive, "plasma_script") as script:
+                restarted.restore_panel_heights()
+            script.assert_not_called()
+
+    def test_panel_height_failure_keeps_snapshot_but_restores_windows(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.json"
+            state = recovery_state()
+            state["plasma"] = {"panels": [{"id": 7, "output": "DP-1", "height": 44}]}
+            exclusive.atomic_save(path, state)
+            guardian = exclusive.Guardian(path, None)
+            with patch.object(guardian, "unload"), patch.object(exclusive, "outputs", return_value=[output()]), patch.object(exclusive, "doctor"), patch.object(exclusive, "plasma_script", return_value=False), patch.object(guardian, "restore_plasma"), patch.object(guardian, "script", return_value=True) as windows:
+                with self.assertRaisesRegex(RuntimeError, "Panel thickness restore incomplete"):
+                    guardian.restore()
+            windows.assert_called_once()
+            self.assertEqual(json.loads(path.read_text())["panel_recovery"], "restoring")
+            self.assertEqual(json.loads(path.read_text())["output_recovery"], "exact")
+
+    def test_legacy_snapshots_do_not_invent_panel_heights(self):
+        guardian = exclusive.Guardian(Path("/not-a-recovery-state-file"), None)
+        guardian.state = {"plasma": {"panels": [{"id": 7, "output": "DP-1"}]}}
+        with patch.object(exclusive, "plasma_script") as script:
+            guardian.restore_panel_heights()
+        script.assert_not_called()
+
     def test_recovery_parking_moves_only_owned_virtual_outputs(self):
         with tempfile.TemporaryDirectory() as directory:
             guardian = exclusive.Guardian(Path(directory) / "state.json", None)

@@ -1023,17 +1023,27 @@ Exclusive mode additionally requires `/usr/bin/python3`, `python3-dbus`,
 guardian syncs the original connector modes (size and fractional refresh),
 positions, scale, rotation, enabled status, priorities and replication sources;
 window opaque IDs, output names, visible geometry and maximized/fullscreen/
-minimized states; and Plasma desktop/panel containment IDs and connector
-assignments. Recovery data lives at
+minimized states; and Plasma desktop/panel containment IDs, connector
+assignments and original panel thicknesses. Recovery data lives at
 `$XDG_STATE_HOME/sunshine/kwin-exclusive.json` (default
 `~/.local/state/sunshine/kwin-exclusive.json`, mode 0600). It records no window
 titles, widget contents or application data. A connected physical connector that
 was already disabled causes exclusive initialization to fall back to normal
 capture: this policy never disables a connector, including during restoration.
 
-The guardian clears temporary replicas, restores the physical layout and Plasma
-assignments, then restores surviving windows before releasing the virtual
-output. Failed exact restoration enables connected original outputs at preferred
+While exclusive panels are on the virtual output, their thickness is raised to
+`max(original thickness, 44, round(28 * virtual output scale))` logical pixels.
+At 250% this is 70 logical pixels (175 stream pixels), providing a larger touch
+target. This is a client-scale heuristic rather than a physical-DPI measurement.
+Other panel properties remain unchanged. New panels without a saved original
+thickness are not resized. Original thicknesses are restored on disconnect,
+crash and emergency recovery, including degraded connector recovery. A separate
+synced thickness-completion marker prevents later placement/window retries from
+overwriting a thickness chosen after that stage completed.
+
+The guardian clears temporary replicas, restores the physical layout, original
+panel thicknesses and Plasma assignments, then restores surviving windows before
+releasing the virtual output. Failed exact restoration enables connected original outputs at preferred
 modes and retains the snapshot for retry. A lost guardian is recovered by
 Sunshine; a lost Sunshine lifeline triggers immediate guardian recovery.
 **Service deployments must also run the helper's `restore` action in
@@ -1093,6 +1103,13 @@ native pixel density. For example, `150` enlarges desktop controls while keeping
 the requested physical stream resolution. Absolute mouse mapping uses logical
 output bounds; relative input shares the local seat. Click a desktop/window to
 give it keyboard focus.
+
+Clients may send the optional `virtualDisplayScale` integer percentage on HTTPS
+`/launch` and `/resume`. Valid values (`100`–`400`) override this setting for that
+stream's KWin virtual output, including retained-output reconnects. Missing,
+malformed, or out-of-range hints use the configured fallback. Physical output
+scales and the global configuration remain unchanged. Older clients need no
+changes; hosts without this extension ignore the extra query parameter.
 
 ### output_name
 

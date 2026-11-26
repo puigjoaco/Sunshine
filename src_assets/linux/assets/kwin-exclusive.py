@@ -74,16 +74,23 @@ def plasma_script(code):
                           "org.kde.PlasmaShell.evaluateScript", code))
 
 
+def touch_panel_height(scale):
+    """Estimate touch thickness from client scale: 70 logical pixels at 250%."""
+    return max(44, round(28 * scale))
+
+
 def plasma_snapshot(saved):
-    """Persist containment IDs and connector assignments before changing primary."""
+    """Persist containment IDs, assignments and panel thickness before changes."""
     if run("qdbus6", "org.freedesktop.DBus", "/org/freedesktop/DBus",
            "org.freedesktop.DBus.NameHasOwner", "org.kde.plasmashell") != "true":
         return None
     return plasma_script("var OUTPUTS=" + json.dumps([o["name"] for o in saved]) + ";" + """
-function rows(items) { return items.filter(function(c){return c.screen>=0;}).map(function(c){
-    return {id:c.id, output:OUTPUTS.find(function(name){return screenForConnector(name)===c.screen;})};
+function rows(items,isPanel) { return items.filter(function(c){return c.screen>=0;}).map(function(c){
+    var row={id:c.id, output:OUTPUTS.find(function(name){return screenForConnector(name)===c.screen;})};
+    if(isPanel) row.height=c.height;
+    return row;
 }).filter(function(s){return typeof s.output==='string';}); }
-print(JSON.stringify({desktops:rows(desktops()),panels:rows(panels())}));
+print(JSON.stringify({desktops:rows(desktops()),panels:rows(panels(),true)}));
 """)
 
 
@@ -335,29 +342,62 @@ move(); report(true);
             doctor(positions)
             self.state["policy"] = "move"
             atomic_save(self.path, self.state)
-        self.move_plasma(name)
+        self.move_plasma(name, touch_panel_height(target["scale"]))
         actual = outputs()
         target = next(o for o in actual if o["name"] == name)
         if not target["enabled"] or target["priority"] != 1 or target["pos"] != {"x": 0, "y": 0} or any(not o["enabled"] for o in actual if o["name"] in {s["name"] for s in originals}):
             raise RuntimeError("KWin rejected primary/always-enabled policy; restoring originals")
         print("exclusive: policy=" + self.state["policy"] + "; physical connectors remain enabled", file=sys.stderr)
 
-    def move_plasma(self, target):
-        """Put original primary desktop and all panels on the virtual connector."""
+    def move_plasma(self, target, height=None):
+        """Move containments, enlarging only snapshotted panels on a virtual output."""
         saved = self.state.get("plasma")
         if saved is None:
             return
         primary = min(self.state["outputs"], key=lambda o: o["priority"] or 1000)["name"]
         ids = [d["id"] for d in saved["desktops"] if d.get("output") == primary]
-        result = plasma_script("var TARGET=" + json.dumps(target) + ";var IDS=" + json.dumps(ids) + ";" + """
+        result = plasma_script("var TARGET=" + json.dumps(target) + ";var IDS=" + json.dumps(ids) +
+                               ";var HEIGHT=" + json.dumps(height) + ";var PANELS=" + json.dumps(saved["panels"]) + ";" + """
 var index=screenForConnector(TARGET);
 if(index<0) throw new Error('Virtual Plasma screen not found');
 desktops().filter(function(d){return IDS.indexOf(d.id)>=0;}).forEach(function(d){d.screen=index;});
-panels().forEach(function(p){p.screen=index;});
-print(JSON.stringify(true));
+var valid=true;
+panels().forEach(function(p){
+    p.screen=index;
+    var original=PANELS.find(function(s){return s.id===p.id;});
+    if(HEIGHT!==null && original && typeof original.height==='number' && original.height>0) {
+        var wanted=Math.max(original.height,HEIGHT);
+        if(p.height!==wanted) p.height=wanted;
+        if(p.height!==wanted) valid=false;
+    }
+});
+print(JSON.stringify(valid));
 """)
         if result is not True:
             raise RuntimeError("Plasma did not acknowledge virtual desktop/panels")
+
+    def restore_panel_heights(self):
+        """Restore thickness once, independently of connector/window recovery retries."""
+        saved = self.state.get("plasma")
+        panels = [p for p in (saved or {}).get("panels", []) if isinstance(p.get("height"), (int, float))
+                  and math.isfinite(p["height"]) and p["height"] > 0]
+        if not panels or self.state.get("panel_recovery") == "exact":
+            return
+        self.state["panel_recovery"] = "restoring"
+        atomic_save(self.path, self.state)
+        result = plasma_script("var SAVED=" + json.dumps(panels) + ";" + """
+var missing=[];
+SAVED.forEach(function(s){
+    var p=panelById(s.id);
+    if(p && p.height!==s.height) p.height=s.height;
+    if(!p || p.height!==s.height) missing.push(s.id);
+});
+print(JSON.stringify(missing.length===0 ? true : {panels:missing}));
+""")
+        if result is not True:
+            raise RuntimeError("Panel thickness restore incomplete; original snapshot retained: " + json.dumps(result))
+        self.state["panel_recovery"] = "exact"
+        atomic_save(self.path, self.state)
 
     def restore_plasma(self, timeout=3):
         """Wait for connectors/containments and verify all saved assignments."""
@@ -476,6 +516,12 @@ var timer=new QTimer();timer.interval=100;timer.timeout.connect(recover);timer.s
                     raise RuntimeError("Emergency output enable failed readback")
                 saved["output_recovery"] = "degraded"
             atomic_save(self.path, saved)
+        panel_error = None
+        try:
+            self.restore_panel_heights()
+        except Exception as error:
+            panel_error = error
+            print(f"exclusive panel thickness restore: {error}", file=sys.stderr)
         if saved["output_recovery"] != "exact":
             # A crash during the output transaction leaves an uncertain result.
             # Clear only our temporary mirrors; never replay saved modes/positions.
@@ -487,7 +533,7 @@ var timer=new QTimer();timer.interval=100;timer.timeout.connect(recover);timer.s
             self.recover_desktop()
             raise RuntimeError("Degraded desktop recovery completed; original snapshot retained")
         self.park_virtual_outputs()
-        plasma_error = None
+        plasma_error = panel_error
         try:
             self.restore_plasma()
         except Exception as error:
