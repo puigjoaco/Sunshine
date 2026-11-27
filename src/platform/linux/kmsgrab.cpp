@@ -23,6 +23,7 @@
 // local includes
 #include "cuda.h"
 #include "graphics.h"
+#include "misc.h"
 #include "src/config.h"
 #include "src/logging.h"
 #include "src/platform/common.h"
@@ -37,6 +38,13 @@ using namespace std::literals;
 namespace fs = std::filesystem;
 
 namespace platf {
+
+  /**
+   * @brief Enumerate active and connected sleeping KMS outputs for an encoder device.
+   * @param hwdevice_type Hardware device type requested for capture or encode.
+   * @return DRM connector names usable for capture or an encoder-only sleeping probe.
+   */
+  std::vector<std::string> kms_display_names(mem_type_e hwdevice_type);
 
   namespace kms {
 
@@ -88,6 +96,31 @@ namespace platf {
 
         static void drop_worker_privileges() {
           instance().drop_privileges();
+        }
+
+        /**
+         * @brief Check that the worker can export framebuffer handles after DPMS wakes.
+         * @return True when the worker retains the privileges required for KMS capture.
+         */
+        static bool can_export_framebuffers() {
+          try {
+            return instance().run([] {
+#if !defined(__FreeBSD__)
+              const auto caps = cap_get_proc();
+              if (!caps) {
+                return false;
+              }
+              cap_flag_value_t value = CAP_CLEAR;
+              const auto status = cap_get_flag(caps, CAP_SYS_ADMIN, CAP_EFFECTIVE, &value);
+              cap_free(caps);
+              return status == 0 && value == CAP_SET;
+#else
+              return true;
+#endif
+            });
+          } catch (const privileged_drm_worker_stopped &) {
+            return false;
+          }
         }
 
         // deliberately align prototype to match path signature via init(const char *path)
@@ -375,6 +408,9 @@ namespace platf {
       std::uint32_t connector_id;  ///< Connector ID.
 
       bool connected;  ///< Whether the DRM connector is connected.
+      bool dpms_off;  ///< Whether the connector DPMS property reports powered down.
+      int width;  ///< Preferred mode width, available even without an active CRTC.
+      int height;  ///< Preferred mode height, available even without an active CRTC.
     };
 
     /**
@@ -401,6 +437,16 @@ namespace platf {
     };
 
     static std::vector<card_descriptor_t> card_descriptors;
+
+    /**
+     * @brief Connected sleeping output retained independently of a CRTC or framebuffer.
+     */
+    struct sleeping_output_t {
+      std::string name;  ///< Stable DRM connector name.
+      connector_t connector;  ///< Connection, power, and preferred mode metadata.
+    };
+
+    static std::vector<sleeping_output_t> sleeping_outputs;  ///< Sleeping outputs from the latest DRM enumeration.
 
     static std::uint32_t from_view(const std::string_view &string) {
 #ifndef DOXYGEN
@@ -790,6 +836,9 @@ namespace platf {
         std::vector<connector_t> monitors;
         std::for_each_n(resources->connectors, resources->count_connectors, [this, &conn_type_count, &monitors](std::uint32_t id) {
           auto conn = connector(id);
+          if (!conn) {
+            return;
+          }
 
           std::uint32_t crtc_id = 0;
 
@@ -802,12 +851,30 @@ namespace platf {
 
           ++conn_type_count[conn->connector_type];
 
+          // DPMS off removes the CRTC/plane on atomic compositors. EDID modes
+          // and the connector itself remain available and must not disappear.
+          int width = 0;
+          int height = 0;
+          for (int mode = 0; mode < conn->count_modes; ++mode) {
+            if (mode == 0 || (conn->modes[mode].type & DRM_MODE_TYPE_PREFERRED)) {
+              width = conn->modes[mode].hdisplay;
+              height = conn->modes[mode].vdisplay;
+              if (conn->modes[mode].type & DRM_MODE_TYPE_PREFERRED) {
+                break;
+              }
+            }
+          }
+          const auto dpms = prop_value_by_name(connector_props(id), "DPMS"sv);
+
           monitors.emplace_back(connector_t {
             conn->connector_type,
             crtc_id,
             conn->connector_type_id,
             conn->connector_id,
             conn->connection == DRM_MODE_CONNECTED,
+            dpms && *dpms == DRM_MODE_DPMS_OFF,
+            width,
+            height,
           });
         });
 
@@ -936,6 +1003,9 @@ namespace platf {
       std::map<std::uint32_t, monitor_t> result;
 
       for (auto &connector : connectors) {
+        if (!connector.connected || !connector.crtc_id) {
+          continue;
+        }
         result.emplace(connector.crtc_id, monitor_t {
                                             .type = connector.type,
                                             .index = connector.index,
@@ -954,6 +1024,65 @@ namespace platf {
         data = nullptr;
       }
     };
+
+#ifdef SUNSHINE_BUILD_CUDA
+    /**
+     * @brief Probe NVENC with a blank GPU texture while a real DRM output is asleep.
+     *
+     * This is never returned to a client capture request. Encoder validation still opens
+     * the CUDA device, converts pixels, and encodes an IDR frame; only scanout is deferred.
+     */
+    class sleeping_probe_t final: public platf::display_t {
+    public:
+      /**
+       * @brief Initialize probe geometry from a connected output's preferred mode.
+       * @param connector Sleeping DRM connector with a valid preferred mode.
+       */
+      explicit sleeping_probe_t(const connector_t &connector) {
+        width = env_width = logical_width = env_logical_width = connector.width;
+        height = env_height = logical_height = env_logical_height = connector.height;
+      }
+
+      /**
+       * @brief Reject capture: a probe cannot stand in for a live display.
+       * @return Always a capture error.
+       */
+      capture_e capture(const push_captured_image_cb_t &, const pull_free_image_cb_t &, bool *) override {
+        return capture_e::error;
+      }
+
+      /**
+       * @brief Allocate the zero-sequence descriptor that requests a blank GPU texture.
+       * @return Dummy image descriptor owned by the caller.
+       */
+      std::shared_ptr<img_t> alloc_img() override {
+        auto img = std::make_shared<egl::img_descriptor_t>();
+        img->width = width;
+        img->height = height;
+        img->pixel_pitch = 4;
+        img->serial = std::numeric_limits<decltype(img->serial)>::max();
+        img->sequence = 0;
+        std::fill_n(img->sd.fds, 4, -1);
+        return img;
+      }
+
+      /**
+       * @brief Accept the dummy descriptor initialized by alloc_img().
+       * @return Zero on success.
+       */
+      int dummy_img(img_t *) override {
+        return 0;
+      }
+
+      /**
+       * @brief Open the same OpenGL/CUDA conversion device used by KMS video.
+       * @return CUDA encode device, or nullptr when GPU initialization fails.
+       */
+      std::unique_ptr<avcodec_encode_device_t> make_avcodec_encode_device(pix_fmt_e) override {
+        return cuda::make_avcodec_gl_encode_device(width, height, 0, 0);
+      }
+    };
+#endif
 
     /**
      * @brief Write a debug log representation of the input packet.
@@ -1044,7 +1173,6 @@ namespace platf {
         delay = ::video::capture_frame_interval(config);
 
         int monitor_index = map_display_name_to_monitor_index(display_name);
-        int monitor = 0;
 
         fs::path card_dir {"/dev/dri"sv};
         for (auto &entry : fs::directory_iterator {card_dir}) {
@@ -1088,8 +1216,12 @@ namespace platf {
               continue;
             }
 
-            if (monitor != monitor_index) {
-              ++monitor;
+            const auto descriptor = std::ranges::find(card_descriptors, filestring, &card_descriptor_t::path);
+            if (descriptor == card_descriptors.end()) {
+              continue;
+            }
+            const auto mapped = descriptor->crtc_to_monitor.find(plane->crtc_id);
+            if (mapped == descriptor->crtc_to_monitor.end() || !mapped->second.viewport.width || !mapped->second.viewport.height || mapped->second.monitor_index != monitor_index) {
               continue;
             }
 
@@ -2054,6 +2186,43 @@ namespace platf {
    * @return KMS display backend, or nullptr when initialization fails.
    */
   std::shared_ptr<display_t> kms_display(mem_type_e hwdevice_type, const std::string &display_name, const ::video::config_t &config) {
+    // Refresh after the client's input device wakes the compositor: startup may
+    // have found no active CRTC, and both CRTC IDs and plane ordering can change.
+    auto names = kms_display_names(hwdevice_type);
+    std::string selected = display_name;
+    if (selected.empty() || std::ranges::all_of(selected, ::isdigit)) {
+      const auto index = selected.empty() ? 0 : util::from_view(selected);
+      if (index >= 0 && index < names.size()) {
+        selected = names[index];
+      }
+    }
+    auto sleeping = [&]() {
+      return std::ranges::find(kms::sleeping_outputs, selected, &kms::sleeping_output_t::name);
+    };
+    if (auto output = sleeping(); output != kms::sleeping_outputs.end()) {
+#ifdef SUNSHINE_BUILD_CUDA
+      const auto &connector = output->connector;
+      if (hwdevice_type == mem_type_e::cuda && kms::can_probe_sleeping_output(connector.connected, connector.dpms_off, connector.width, connector.height, config.client_stream)) {
+        BOOST_LOG(info) << "KMS output " << selected << " is asleep; probing NVENC without waking scanout (" << connector.width << 'x' << connector.height << ')';
+        return std::make_shared<kms::sleeping_probe_t>(connector);
+      }
+#endif
+      if (!config.client_stream) {
+        return nullptr;
+      }
+      BOOST_LOG(info) << "Waiting for sleeping KMS output " << selected << " to wake from session input";
+      const auto deadline = std::chrono::steady_clock::now() + 3s;
+      do {
+        std::this_thread::sleep_for(100ms);
+        names = kms_display_names(hwdevice_type);
+        // DPMS can report on before the connector has an enumerable scanout framebuffer.
+      } while ((sleeping() != kms::sleeping_outputs.end() || std::ranges::find(names, selected) == names.end()) &&
+               std::chrono::steady_clock::now() < deadline);
+      if (sleeping() != kms::sleeping_outputs.end() || std::ranges::find(names, selected) == names.end()) {
+        BOOST_LOG(error) << "KMS output " << selected << " has no active scanout after session input; the compositor must allow input to wake DPMS";
+        return nullptr;
+      }
+    }
     if (hwdevice_type == mem_type_e::vaapi || hwdevice_type == mem_type_e::cuda || hwdevice_type == mem_type_e::vulkan) {
       auto disp = std::make_shared<kms::display_vram_t>(hwdevice_type);
 
@@ -2148,6 +2317,7 @@ namespace platf {
    */
   std::vector<std::string> kms_display_names(mem_type_e hwdevice_type) {
     int count = 0;
+    kms::sleeping_outputs.clear();
 
     if (!fs::exists("/dev/dri")) {
       BOOST_LOG(warning) << "Couldn't find /dev/dri, kmsgrab won't be enabled"sv;
@@ -2197,7 +2367,19 @@ namespace platf {
         continue;
       }
 
-      auto crtc_to_monitor = kms::map_crtc_to_monitor(card.monitors(conn_type_count));
+      const auto connectors = card.monitors(conn_type_count);
+      auto crtc_to_monitor = kms::map_crtc_to_monitor(connectors);
+
+      for (const auto &connector : connectors) {
+        if (card.count() && kms::can_probe_sleeping_output(connector.connected, connector.dpms_off, connector.width, connector.height, false) && kms::privileged_drm_worker::can_export_framebuffers()) {
+          kms::sleeping_outputs.push_back({
+            std::format("{}-{}", drmModeGetConnectorTypeName(connector.type), connector.index),
+            connector,
+          });
+          // A powered-down CRTC can retain stale plane/FB IDs and zero geometry.
+          crtc_to_monitor.erase(connector.crtc_id);
+        }
+      }
 
       auto end = std::end(card);
       for (auto plane = std::begin(card); plane != end; ++plane) {
@@ -2233,15 +2415,16 @@ namespace platf {
         }
 
         auto it = crtc_to_monitor.find(plane->crtc_id);
-        if (it != std::end(crtc_to_monitor)) {
-          it->second.viewport = platf::touch_port_t {
-            .offset_x = (int) crtc->x,
-            .offset_y = (int) crtc->y,
-            .width = (int) crtc->width,
-            .height = (int) crtc->height,
-          };
-          it->second.monitor_index = count;
+        if (it == std::end(crtc_to_monitor) || !crtc->width || !crtc->height) {
+          continue;
         }
+        it->second.viewport = platf::touch_port_t {
+          .offset_x = (int) crtc->x,
+          .offset_y = (int) crtc->y,
+          .width = (int) crtc->width,
+          .height = (int) crtc->height,
+        };
+        it->second.monitor_index = count;
 
         kms::env_width = std::max(kms::env_width, (int) (crtc->x + crtc->width));
         kms::env_height = std::max(kms::env_height, (int) (crtc->y + crtc->height));
@@ -2285,6 +2468,10 @@ namespace platf {
     BOOST_LOG(debug) << "Desktop resolution: "sv << kms::env_width << 'x' << kms::env_height;
 
     kms::card_descriptors = std::move(cds);
+
+    for (const auto &output : kms::sleeping_outputs) {
+      display_names.push_back(output.name);
+    }
 
     BOOST_LOG(debug) << "Final KMS display_names return list: " << (display_names | std::views::join_with(' ') | std::ranges::to<std::string>());
     return display_names;

@@ -399,7 +399,8 @@ TEST(KwinPortraitEncoderLiveTest, ConvertsNegotiatedCaptureAndEncodesAt120HzWith
   });
   config::video.capture = "kwin";
   config::video.virtual_display = true;
-  config::video.virtual_display_mode = "extend";
+  // Explicit DPMS verification also exercises the production exclusive path.
+  config::video.virtual_display_mode = lizardbyte::common::get_env("SUNSHINE_TEST_KWIN_DPMS") == "1" ? "exclusive" : "extend";
   const auto platform = platf::init();
   ASSERT_TRUE(platform);
   ASSERT_EQ(cuda::init(), 0);

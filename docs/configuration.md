@@ -995,6 +995,19 @@ Configure a restart delay in the supervisor; this also handles displays becoming
 available at the login greeter. Other capture settings retain the configuration
 UI after an unsuccessful startup probe.
 
+A connected KMS output with DPMS off remains discoverable through its preferred
+mode even when the compositor removes its CRTC or framebuffer. On CUDA/NVENC,
+startup validates a real GPU encoder using initialized dummy pixels without
+waking that output. This requires an accessible DRM card with planes and a DRM
+worker retaining framebuffer-export privileges; disconnected outputs, missing
+modes and unavailable GPU encoders still fail startup. The probe display is
+never used as client video. In Plasma, a stream creates the KWin virtual output
+as usual. The KMS fallback waits up to three seconds for the normal session-start
+mouse motion to wake scanout, then refreshes its CRTC/plane mapping. At an SDDM
+greeter this requires that its compositor accept Sunshine's uinput mouse and
+allow input to wake DPMS. If it does not, capture fails with an explicit scanout
+error; configure the greeter's display power policy to stay on in that case.
+
 Only one client at a time is supported for exclusive mode. Simultaneous clients
 share one capture owner and its mode. Once an exclusive stream has a control
 peer, abrupt loss uses the smaller of `ping_timeout` and three seconds. The

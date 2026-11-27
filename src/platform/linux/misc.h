@@ -105,7 +105,7 @@ namespace platf {
     }
   }
 
-#if defined(__linux__) && defined(SUNSHINE_BUILD_DRM)
+#if (defined(__linux__) || defined(__FreeBSD__)) && defined(SUNSHINE_BUILD_DRM)
   namespace kms {
     /**
      * @brief Determine whether KMS must remain usable even when display discovery fails.
@@ -118,6 +118,23 @@ namespace platf {
      */
     constexpr bool capture_is_required(std::string_view capture) {
       return capture == "kms";
+    }
+
+    /**
+     * @brief Allow a real encoder probe without a scanout frame only for a sleeping connected output.
+     *
+     * A successful probe still has to encode a dummy frame on the GPU. This exception never
+     * provides a capture backend to a client, or masks disconnected/invalid DRM outputs.
+     *
+     * @param connected Whether DRM reports a connected monitor.
+     * @param dpms_off Whether the connector is explicitly powered down.
+     * @param width Preferred mode width in pixels.
+     * @param height Preferred mode height in pixels.
+     * @param client_stream Whether this is an actual streaming capture request.
+     * @return True when scanout may be deferred until the client wakes the compositor.
+     */
+    constexpr bool can_probe_sleeping_output(bool connected, bool dpms_off, int width, int height, bool client_stream) {
+      return connected && dpms_off && width > 0 && height > 0 && !client_stream;
     }
 
     /**

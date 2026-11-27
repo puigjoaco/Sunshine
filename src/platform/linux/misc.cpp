@@ -1315,7 +1315,7 @@ namespace platf {
 #ifdef SUNSHINE_BUILD_DRM
     if (sources[source::KMS]) {
       BOOST_LOG(info) << "Screencasting with KMS"sv;
-      return kms_display(hwdevice_type, display_name, config);
+      return kms_display(hwdevice_type, display_name, requested_config);
     }
 #endif
 

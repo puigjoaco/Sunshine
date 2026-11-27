@@ -15,8 +15,10 @@
   #include <gtest/gtest.h>
 
   // local includes
+  #include "src/config.h"
   #include "src/logging.h"
   #include "src/platform/linux/misc.h"
+  #include "src/video.h"
 
 namespace {
   /**
@@ -121,6 +123,83 @@ TEST(KmsCapturePolicy, OtherBackendsPreserveOptionalStartupBehavior) {
     EXPECT_FALSE(platf::kms::capture_is_required(capture)) << capture;
   }
 }
+
+TEST(KmsCapturePolicy, SleepingConnectedOutputCanProbeWithoutScanout) {
+  EXPECT_TRUE(platf::kms::can_probe_sleeping_output(true, true, 2560, 1440, false));
+}
+
+TEST(KmsCapturePolicy, SleepingOutputNeverSuppliesFakeClientCapture) {
+  EXPECT_FALSE(platf::kms::can_probe_sleeping_output(true, true, 2560, 1440, true));
+}
+
+TEST(KmsCapturePolicy, MissingOrAwakeOutputsDoNotBypassCaptureValidation) {
+  EXPECT_FALSE(platf::kms::can_probe_sleeping_output(false, true, 2560, 1440, false));
+  EXPECT_FALSE(platf::kms::can_probe_sleeping_output(true, false, 2560, 1440, false));
+  EXPECT_FALSE(platf::kms::can_probe_sleeping_output(true, true, 0, 1440, false));
+  EXPECT_FALSE(platf::kms::can_probe_sleeping_output(true, true, 2560, 0, false));
+  EXPECT_FALSE(platf::kms::can_probe_sleeping_output(true, true, -1, 1440, false));
+  EXPECT_FALSE(platf::kms::can_probe_sleeping_output(true, true, 2560, -1, false));
+}
+
+    #ifdef SUNSHINE_BUILD_CUDA
+TEST(KmsSleepingOutputLiveTest, ValidatesRealNvencWithoutScanout) {
+  const auto *output = std::getenv("SUNSHINE_TEST_KMS_SLEEPING_OUTPUT");
+  if (!output || !*output) {
+    GTEST_SKIP() << "Requires an explicitly selected sleeping DRM output and CAP_SYS_ADMIN";
+  }
+  ASSERT_TRUE(platf::sanitize_process_environment());
+  platf::kms::ensure_privileged_drm_worker_started();
+  platf::drop_elevated_privileges(true);
+  const auto saved = config::video;
+  const auto restore = util::fail_guard([&] {
+    config::video = saved;
+  });
+  config::video.capture = "kms";
+  config::video.output_name = output;
+  config::video.encoder = "nvenc";
+  config::video.hevc_mode = 0;
+  config::video.av1_mode = 0;
+  const auto platform = platf::init();
+  ASSERT_TRUE(platform);
+  const auto names = platf::display_names(platf::mem_type_e::cuda);
+  ASSERT_NE(std::ranges::find(names, output), names.end());
+  ASSERT_EQ(video::probe_encoders(), 0);
+
+  // With no session input allocated, the sleeping connector must never yield
+  // a fake display to a streaming request even after a successful encode probe.
+  video::config_t client {};
+  client.width = 1920;
+  client.height = 1080;
+  client.framerate = 60;
+  client.client_stream = true;
+  EXPECT_FALSE(platf::display(platf::mem_type_e::cuda, output, client));
+
+  if (const auto *wake = std::getenv("SUNSHINE_TEST_KMS_WAKE"); wake && std::string_view(wake) == "1") {
+    // Exercise the same uinput mouse motion used before greeter capture, without
+    // relying on a user-session KWin fake-input connection or a physical mouse.
+    auto input = platf::input();
+    ASSERT_TRUE(input);
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    platf::move_mouse(input, 1, 1);
+    platf::move_mouse(input, -1, -1);
+    const auto display = platf::display(platf::mem_type_e::cuda, output, client);
+    ASSERT_TRUE(display);
+    bool cursor = false;
+    bool captured = false;
+    EXPECT_EQ(display->capture([&](std::shared_ptr<platf::img_t> &&image, bool valid) {
+      captured = valid && image && image->width > 0 && image->height > 0;
+      return false;
+    },
+                               [&](std::shared_ptr<platf::img_t> &image) {
+                                 image = display->alloc_img();
+                                 return image != nullptr;
+                               },
+                               &cursor),
+              platf::capture_e::ok);
+    EXPECT_TRUE(captured);
+  }
+}
+    #endif
   #endif
 
 #endif  // __linux__
