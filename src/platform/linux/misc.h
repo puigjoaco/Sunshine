@@ -8,6 +8,7 @@
 #include <chrono>
 #include <fcntl.h>
 #include <filesystem>
+#include <string_view>
 #include <thread>
 #include <unistd.h>
 #include <vector>
@@ -106,6 +107,19 @@ namespace platf {
 
 #if defined(__linux__) && defined(SUNSHINE_BUILD_DRM)
   namespace kms {
+    /**
+     * @brief Determine whether KMS must remain usable even when display discovery fails.
+     *
+     * Explicit KMS capture requires the DRM worker for this process's lifetime. A failed
+     * startup probe must preserve its privileges and fail startup so a supervisor can retry.
+     *
+     * @param capture Configured capture backend; an empty string selects automatic discovery.
+     * @return True only when the user explicitly requires KMS capture.
+     */
+    constexpr bool capture_is_required(std::string_view capture) {
+      return capture == "kms";
+    }
+
     /**
      * @brief Force-construct the DRM privileged worker thread while the calling
      *        thread still holds CAP_SYS_ADMIN in CAP_PERMITTED.

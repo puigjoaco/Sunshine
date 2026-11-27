@@ -471,6 +471,16 @@ int main(int argc, char *argv[]) {
 
   if (video::probe_encoders()) {
     BOOST_LOG(error) << "Video failed to find working encoder"sv;
+#if defined(__linux__) && defined(SUNSHINE_BUILD_DRM)
+    if (platf::kms::capture_is_required(config::video.capture)) {
+      // KMS discovery runs only during platform initialization. Start a fresh process
+      // instead of advertising an unusable host after a transient boot/output failure.
+      BOOST_LOG(error) << "KMS startup probe failed; exiting in 5 seconds so the service supervisor can retry"sv;
+      logging::log_flush();
+      shutdown_event->view(5s);
+      return 1;
+    }
+#endif
   }
 
   if (http::init()) {

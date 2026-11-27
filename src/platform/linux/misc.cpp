@@ -1310,7 +1310,7 @@ namespace platf {
     config.client_stream = false;
 
     // Please ensure that KMS followed by CUDA remains at the top so that we can
-    // drop DRM worker privileges once neither backend requires it.
+    // drop DRM worker privileges once neither backend nor the configuration requires it.
 
 #ifdef SUNSHINE_BUILD_DRM
     if (sources[source::KMS]) {
@@ -1327,8 +1327,11 @@ namespace platf {
 #endif
 
 #ifdef SUNSHINE_BUILD_DRM
-    // Drop all DRM worker thread privileges if not needed for this process's lifetime.
-    platf::kms::drop_drm_worker_privileges();
+    // Discovery can fail transiently while the compositor changes outputs. Never
+    // permanently discard privileges required by an explicitly configured KMS backend.
+    if (!platf::kms::capture_is_required(config::video.capture)) {
+      platf::kms::drop_drm_worker_privileges();
+    }
 #endif
 
 #ifdef SUNSHINE_BUILD_WAYLAND

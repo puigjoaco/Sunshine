@@ -987,6 +987,14 @@ example `capture = kms` with a physical `output_name`. Reconnect after logging
 in to switch a greeter stream to KWin. Failed virtual initialization restores
 exclusive state immediately before falling back.
 
+On Linux builds with KMS support, an explicit `capture = kms` keeps the DRM
+worker's privileges even if startup display discovery fails. If no display and
+encoder combination works at startup, Sunshine waits up to five seconds and
+exits with failure so a service supervisor can restart it and repeat discovery.
+Configure a restart delay in the supervisor; this also handles displays becoming
+available at the login greeter. Other capture settings retain the configuration
+UI after an unsuccessful startup probe.
+
 Only one client at a time is supported for exclusive mode. Simultaneous clients
 share one capture owner and its mode. Abrupt network loss first waits for
 `ping_timeout` (default 10 seconds); the restore grace starts when capture ends.

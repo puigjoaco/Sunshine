@@ -109,4 +109,18 @@ TEST_F(ProcessEnvironmentSecurity, PreservesTraySessionVariables) {
   EXPECT_STREQ(std::getenv("WAYLAND_DISPLAY"), "wayland-test");
 }
 
+  #ifdef SUNSHINE_BUILD_DRM
+TEST(KmsCapturePolicy, ExplicitKmsRemainsRequiredWithoutDiscoveredDisplays) {
+  // Discovery may fail at the greeter or during an exclusive-output restore.
+  // Both privilege retention and fatal startup handling must follow configuration.
+  EXPECT_TRUE(platf::kms::capture_is_required("kms"));
+}
+
+TEST(KmsCapturePolicy, OtherBackendsPreserveOptionalStartupBehavior) {
+  for (const auto *capture : {"", "nvfbc", "wlr", "x11", "portal", "kwin"}) {
+    EXPECT_FALSE(platf::kms::capture_is_required(capture)) << capture;
+  }
+}
+  #endif
+
 #endif  // __linux__
