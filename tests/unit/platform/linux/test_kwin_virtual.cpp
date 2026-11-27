@@ -195,6 +195,49 @@ TEST(KwinExclusiveNestedTest, RecoversSavedDeskWhenGuardianIsKilled) {
   lease.finish(std::move(output), 0);
 }
 
+TEST(KwinExclusiveNestedTest, NormalSessionEndBypassesReconnectGrace) {
+  const auto name = lizardbyte::common::get_env("SUNSHINE_TEST_KWIN_EXCLUSIVE_OUTPUT");
+  const auto runtime = lizardbyte::common::get_env("XDG_RUNTIME_DIR");
+  if (name.empty() || runtime.find("/sunshine-exclusive-") == std::string::npos) GTEST_SKIP();
+  auto output = std::make_shared<int>(42);
+  std::weak_ptr<int> lifetime = output;
+  auto &lease = kwin::exclusive_t::instance();
+  ASSERT_TRUE(lease.prepare(output.get()));
+  ASSERT_TRUE(lease.begin(output.get(), name));
+  lease.session_stopping(false);
+  const auto started = std::chrono::steady_clock::now();
+  lease.finish(std::move(output), 5);
+  while (!lifetime.expired() && std::chrono::steady_clock::now() - started < std::chrono::seconds(3)) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  EXPECT_TRUE(lifetime.expired());
+  EXPECT_LT(std::chrono::steady_clock::now() - started, std::chrono::seconds(3));
+}
+
+TEST(KwinExclusiveNestedTest, RotationSessionEndPreservesReconnectGrace) {
+  const auto name = lizardbyte::common::get_env("SUNSHINE_TEST_KWIN_EXCLUSIVE_OUTPUT");
+  const auto runtime = lizardbyte::common::get_env("XDG_RUNTIME_DIR");
+  if (name.empty() || runtime.find("/sunshine-exclusive-") == std::string::npos) GTEST_SKIP();
+  auto output = std::make_shared<int>(42);
+  std::weak_ptr<int> lifetime = output;
+  auto &lease = kwin::exclusive_t::instance();
+  ASSERT_TRUE(lease.prepare(output.get()));
+  ASSERT_TRUE(lease.begin(output.get(), name));
+  lease.session_stopping(true);
+  lease.finish(std::move(output), 5);
+  EXPECT_FALSE(lifetime.expired());
+  auto resumed = lease.resume();
+  ASSERT_TRUE(resumed);
+  ASSERT_TRUE(lease.begin(resumed.get(), name));
+  lease.session_stopping(false);
+  lease.finish(std::move(resumed), 5);
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+  while (!lifetime.expired() && std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  EXPECT_TRUE(lifetime.expired());
+}
+
 TEST(KwinExclusiveNestedTest, ActiveLeaseRestoresImmediatelyAtProcessExit) {
   const auto name = lizardbyte::common::get_env("SUNSHINE_TEST_KWIN_EXCLUSIVE_OUTPUT");
   const auto runtime = lizardbyte::common::get_env("XDG_RUNTIME_DIR");
@@ -346,10 +389,94 @@ TEST_P(KwinVirtualOutputLiveTest, CapturesNativeClientFrameOverPipeWire) {
   display.reset();
 }
 
+TEST(KwinPortraitEncoderLiveTest, ConvertsNegotiatedCaptureAndEncodesAt120HzWithoutQueueing) {
+  if (lizardbyte::common::get_env("SUNSHINE_TEST_KWIN_VIRTUAL") != "1") {
+    GTEST_SKIP() << "Explicit opt-in required: creates a temporary virtual output in the live session";
+  }
+  const auto saved = config::video;
+  const auto restore = util::fail_guard([&] {
+    config::video = saved;
+  });
+  config::video.capture = "kwin";
+  config::video.virtual_display = true;
+  config::video.virtual_display_mode = "extend";
+  const auto platform = platf::init();
+  ASSERT_TRUE(platform);
+  ASSERT_EQ(cuda::init(), 0);
+  video::config_t client {};
+  client.width = 1440;
+  client.height = 3120;
+  client.framerate = 120;
+  client.client_stream = true;
+  auto display = platf::kwin_display(platf::mem_type_e::cuda, "", client);
+  ASSERT_TRUE(display);
+  auto device = display->make_avcodec_encode_device(platf::pix_fmt_e::nv12);
+  ASSERT_TRUE(device);
+  AVBufferRef *hardware = nullptr;
+  AVBufferRef *frames = nullptr;
+  auto *context = avcodec_alloc_context3(avcodec_find_encoder_by_name("hevc_nvenc"));
+  auto *packet = av_packet_alloc();
+  const auto cleanup = util::fail_guard([&] {
+    device.reset();
+    av_packet_free(&packet);
+    avcodec_free_context(&context);
+    av_buffer_unref(&frames);
+    av_buffer_unref(&hardware);
+  });
+  ASSERT_TRUE(context);
+  ASSERT_TRUE(packet);
+  ASSERT_GE(av_hwdevice_ctx_create(&hardware, AV_HWDEVICE_TYPE_CUDA, nullptr, nullptr, 1), 0);
+  frames = av_hwframe_ctx_alloc(hardware);
+  ASSERT_TRUE(frames);
+  auto *frame_context = reinterpret_cast<AVHWFramesContext *>(frames->data);
+  frame_context->format = AV_PIX_FMT_CUDA;
+  frame_context->sw_format = AV_PIX_FMT_NV12;
+  frame_context->width = 1440;
+  frame_context->height = 3120;
+  device->init_hwframes(frame_context);
+  ASSERT_GE(av_hwframe_ctx_init(frames), 0);
+  context->width = 1440;
+  context->height = 3120;
+  context->pix_fmt = AV_PIX_FMT_CUDA;
+  context->time_base = AVRational {1, 120};
+  context->framerate = AVRational {120, 1};
+  context->hw_frames_ctx = av_buffer_ref(frames);
+  context->bit_rate = 47000000;
+  context->max_b_frames = 0;
+  ASSERT_GE(av_opt_set(context->priv_data, "preset", "p1", 0), 0);
+  ASSERT_GE(av_opt_set(context->priv_data, "tune", "ull", 0), 0);
+  ASSERT_GE(av_opt_set(context->priv_data, "delay", "0", 0), 0);
+  ASSERT_GE(avcodec_open2(context, context->codec, nullptr), 0);
+  auto *frame = av_frame_alloc();
+  ASSERT_TRUE(frame);
+  frame->width = 1440;
+  frame->height = 3120;
+  frame->format = AV_PIX_FMT_CUDA;
+  ASSERT_EQ(device->set_frame(frame, frames), 0);  // Device takes ownership.
+  bool cursor = true;
+  bool encoded = false;
+  EXPECT_EQ(display->capture([&](std::shared_ptr<platf::img_t> &&image, bool captured) {
+    if (captured) {
+      EXPECT_EQ(device->convert(*image), 0);
+      EXPECT_GE(avcodec_send_frame(context, device->frame), 0);
+      encoded = avcodec_receive_packet(context, packet) >= 0;
+    }
+    return false;
+  },
+                             [&](std::shared_ptr<platf::img_t> &image) {
+                               image = display->alloc_img();
+                               return image != nullptr;
+                             },
+                             &cursor),
+            platf::capture_e::ok);
+  EXPECT_TRUE(encoded);
+  EXPECT_GT(packet->size, 0);
+}
+
 INSTANTIATE_TEST_SUITE_P(
   NativeClients,
   KwinVirtualOutputLiveTest,
-  ::testing::Values(virtual_live_case_t {3120, 1440, 60, 0, 100}, virtual_live_case_t {1440, 3120, 60, 0, 100}, virtual_live_case_t {2880, 1800, 90, 0, 150}, virtual_live_case_t {2400, 1600, 60, 5994, 200})
+  ::testing::Values(virtual_live_case_t {3120, 1440, 60, 0, 100}, virtual_live_case_t {1440, 3120, 60, 0, 100}, virtual_live_case_t {1440, 3120, 120, 0, 200}, virtual_live_case_t {2880, 1800, 90, 0, 150}, virtual_live_case_t {2400, 1600, 60, 5994, 200})
 );
 #endif
 

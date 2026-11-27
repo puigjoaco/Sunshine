@@ -23,11 +23,11 @@ extern "C" {
 
 // local includes
 #include "camera.h"
-#include "microphone.h"
 #include "config.h"
 #include "globals.h"
 #include "input.h"
 #include "logging.h"
+#include "microphone.h"
 #include "network.h"
 #include "rtsp.h"
 #include "stream.h"
@@ -668,9 +668,23 @@ namespace rtsp_stream {
     }
 
     /**
-     * @brief Clear by cert state.
-     *
-     * @param cert Certificate data or object used by the operation.
+     * @brief Match an ephemeral launch key without stopping or joining the stream.
+     * @param key Key sent by the currently rotating client.
+     * @return True if the hint was accepted by one active stream.
+     */
+    bool prepare_rotation_reconnect(const crypto::aes_t &key) {
+      auto lg = _session_slots.lock();
+      for (const auto &slot : *_session_slots) {
+        if (stream::session::prepare_rotation_reconnect(*slot, key)) {
+          return true;
+        }
+      }
+      return false;
+    }
+
+    /**
+     * @brief Clear sessions owned by a paired certificate.
+     * @param cert Certificate identifying the sessions to stop.
      */
     void clear_by_cert(std::string_view cert) {
       auto lg = _session_slots.lock();
@@ -764,9 +778,11 @@ namespace rtsp_stream {
     input::terminate_gamepads();
   }
 
-  /**
-   * @brief Terminate active sessions associated with a client certificate.
-   */
+  bool prepare_rotation_reconnect(const crypto::aes_t &key) {
+    return server.prepare_rotation_reconnect(key);
+  }
+
+  /** @brief Terminate active sessions associated with a client certificate. */
   void terminate_sessions_by_cert(std::string_view cert) {
     server.clear_by_cert(cert);
     input::terminate_gamepads(cert);

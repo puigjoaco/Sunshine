@@ -996,8 +996,10 @@ available at the login greeter. Other capture settings retain the configuration
 UI after an unsuccessful startup probe.
 
 Only one client at a time is supported for exclusive mode. Simultaneous clients
-share one capture owner and its mode. Abrupt network loss first waits for
-`ping_timeout` (default 10 seconds); the restore grace starts when capture ends.
+share one capture owner and its mode. Once an exclusive stream has a control
+peer, abrupt loss uses the smaller of `ping_timeout` and three seconds. The
+normal startup timeout remains unchanged. Loss and ordinary disconnects begin
+restoration as soon as capture stops, without an additional reconnect grace.
 This uses the existing desktop login, keyboard, mouse and audio seat.
 
 ### virtual_display_mode
@@ -1020,7 +1022,11 @@ If replication is unavailable or rejected, physical monitors remain independent
 and enabled at their existing modes/scales. Their logical positions temporarily
 move beyond the virtual viewport, all panels move to the virtual display, and
 a temporary KWin script routes existing and new application windows to it and
-keeps them within its bounds. The physical monitors then show their Plasma
+initially fits them within its bounds. Oversized resizable normal windows are
+temporarily maximized before migration, preserving Chromium's preferred normal
+size rather than replacing it with the phone width. Recovery restores the saved
+normal/maximized state. Routing stops once a window settles and does not fight
+a user moving or resizing it. The physical monitors then show their Plasma
 wallpaper desktops, including any desktop icons/widgets; they carry no panels
 or application windows after routing. This fallback is reported in logs as
 `policy=move`; working replication is `policy=mirror`.
@@ -1030,8 +1036,8 @@ Exclusive mode additionally requires `/usr/bin/python3`, `python3-dbus`,
 `sunshine-kwin-output` helper. Before creating the virtual output, an independent
 guardian syncs the original connector modes (size and fractional refresh),
 positions, scale, rotation, enabled status, priorities and replication sources;
-window opaque IDs, output names, visible geometry and maximized/fullscreen/
-minimized states; and Plasma desktop/panel containment IDs, connector
+window opaque IDs, output names, visible geometry, maximized/fullscreen/
+minimized states, virtual-desktop IDs and activity IDs; and Plasma desktop/panel containment IDs, connector
 assignments and original panel thicknesses. Recovery data lives at
 `$XDG_STATE_HOME/sunshine/kwin-exclusive.json` (default
 `~/.local/state/sunshine/kwin-exclusive.json`, mode 0600). It records no window
@@ -1049,9 +1055,14 @@ crash and emergency recovery, including degraded connector recovery. A separate
 synced thickness-completion marker prevents later placement/window retries from
 overwriting a thickness chosen after that stage completed.
 
-The guardian clears temporary replicas, restores the physical layout, original
-panel thicknesses and Plasma assignments, then restores surviving windows before
-releasing the virtual output. Failed exact restoration enables connected original outputs at preferred
+The guardian clears temporary replicas and restores the physical layout and
+original panel thicknesses. Sunshine then releases its retained virtual output,
+so clients see that output disappear before their final window configures.
+The guardian restores Plasma assignments, then surviving original windows in
+separate unmaximize, geometry and state phases. It verifies output, geometry and
+all saved states, finishes early after convergence, and durably records each
+completed window. An unrelated mismatch cannot cause later recovery attempts to
+undo a completed window's newer placement. Failed exact restoration enables connected original outputs at preferred
 modes and retains the snapshot for retry. A lost guardian is recovered by
 Sunshine; a lost Sunshine lifeline triggers immediate guardian recovery.
 **Service deployments must also run the helper's `restore` action in
@@ -1069,8 +1080,15 @@ interval and verified; missing connectors/containments keep the snapshot.
 Retained Sunshine outputs are parked outside the physical viewport during
 recovery so Plasma does not hide an overlapping physical connector as redundant.
 Only these temporary outputs move on subsequent recovery retries.
-Degraded recovery also moves panels and surviving windows onto available
-physical outputs after selecting preferred modes. For example, using the actual
+Degraded recovery also moves panels and surviving snapshotted windows onto
+available physical outputs after selecting preferred modes. Windows created
+after the snapshot are not repositioned by recovery; KWin rehomes them when
+their virtual output disappears. Phone-only geometry changes are temporary:
+surviving originals return to their pre-session layout. A window actively being
+moved/resized during recovery is left to the user. Disconnect also releases all
+held keys/buttons on the selected input source, including a delayed button-up
+cancelled during teardown. If the cursor is outside all physical outputs,
+Sunshine positions it at the primary physical output's center. For example, using the actual
 installed asset path:
 
 @code{.ini}
@@ -1094,15 +1112,20 @@ unchanged; recovery without a snapshot is a no-op and needs no Plasma session.
 ### virtual_display_restore_delay
 
 Linux/KWin exclusive mode only. Integer seconds from `0` to `60`; default `5`.
-Retain the last virtual output and original snapshot after capture ends. A client
-reconnecting within this interval claims that same output and changes its
+Retain the last virtual output and original snapshot across capture
+reinitialization or an explicitly announced rotation reconnect. An ordinary
+session end or missing heartbeat bypasses this delay. Before a deliberate
+rotation stop, Porta sends authenticated HTTPS `/rotation-reconnect` with that
+stream's ephemeral 128-bit launch key. The hint expires after two seconds and
+never stops a stream or an app. Older hosts ignore this optional extension.
+A client reconnecting within the configured grace claims that same output and changes its
 physical mode, including swapped portrait dimensions, while its physical mirrors
 stay enabled. Keeping the output avoids KWin reloading a remembered layout during
 hotplug. Each reconnect starts a new PipeWire capture and encoder session.
 The client must request its new dimensions; Sunshine does not detect phone
 rotation itself. Unsupported resize/custom modes restore immediately and use the
 normal capture fallback. Sunshine exit/crash, initialization failure and emergency
-restore bypass grace. `0` restores the original layout at every disconnect.
+restore bypass grace. `0` also disables rotation reconnect retention.
 
 ### virtual_display_scale
 

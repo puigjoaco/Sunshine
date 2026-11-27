@@ -501,6 +501,26 @@ namespace platf::virtualhid {
     held_keys.clear();
   }
 
+  void input_context_t::end_session() {
+    const std::lock_guard lock {keyboard_mutex};
+#ifdef SUNSHINE_BUILD_KWIN
+    if (kwin_keyboard) {
+      kwin_keyboard->release_all();
+    }
+#endif
+    if (keyboard) {
+      for (auto key : held_keys) {
+        log_failure("release disconnected session key"sv, keyboard->submit(keyboard_event(key, true, 0)));
+      }
+    }
+    held_keys.clear();
+    if (mouse) {
+      for (int button = 1; button <= 5; ++button) {
+        log_failure("release disconnected session button"sv, mouse->button(*mouse_button(button), false));
+      }
+    }
+  }
+
   void input_context_t::refresh_mouse() {
     mouse.reset();
     if (!runtime || !runtime->capabilities().supports_mouse) {

@@ -1704,6 +1704,22 @@ namespace nvhttp {
       resume(host_audio, resp, req);
     };
     https_server.resource["^/cancel$"]["GET"] = cancel;
+    // A hint never stops the app or stream. The fresh launch key binds it to
+    // this exact connection; another paired client cannot arm its grace period.
+    https_server.resource["^/rotation-reconnect$"]["GET"] = [](resp_https_t response, req_https_t request) {
+      const auto args = request->parse_query_string();
+      const auto encoded = get_arg(args, "rikey", "");
+      const bool valid = encoded.size() == 32 && std::all_of(encoded.begin(), encoded.end(), [](unsigned char c) {
+                           return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+                         });
+      pt::ptree tree;
+      tree.put("root.<xmlattr>.status_code", 200);
+      const auto decoded = valid ? util::from_hex_vec(encoded, true) : std::string {};
+      tree.put("root.rotation", valid && rtsp_stream::prepare_rotation_reconnect(crypto::aes_t(decoded.begin(), decoded.end())) ? 1 : 0);
+      std::ostringstream body;
+      pt::write_xml(body, tree);
+      response->write(body.str());
+    };
 
     https_server.config.reuse_address = true;
     https_server.config.address = net::get_bind_address(address_family);

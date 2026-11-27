@@ -4,6 +4,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import shutil
 import tempfile
 import subprocess
 import sys
@@ -29,13 +30,18 @@ def output(name="DP-1", enabled=True, priority=1):
 def recovery_state():
     """A saved active recovery from the same fake compositor session."""
     return {"version": 2, "identity": dict(IDENTITY),
-            "outputs": exclusive.snapshot_outputs([output()]), "windows": [], "plasma": None}
+            "outputs": exclusive.snapshot_outputs([output()]),
+            "windows": [{"id": "saved-window", "output": "DP-1", "geometry": {"x": 150, "y": 100, "width": 600, "height": 400},
+                         "maximized": 0, "fullscreen": False, "minimized": False}], "plasma": None}
 
 
 class ExclusiveTest(unittest.TestCase):
     """Check semantic restore, durable snapshots and degraded recovery."""
 
     def setUp(self):
+        patcher = patch.object(exclusive.Guardian, "cursor_target", return_value=None)
+        patcher.start()
+        self.addCleanup(patcher.stop)
         patcher = patch.object(exclusive, "plasma_snapshot", return_value=None)
         patcher.start()
         self.addCleanup(patcher.stop)
@@ -116,10 +122,11 @@ class ExclusiveTest(unittest.TestCase):
     def test_failed_persistence_never_runs_an_output_transaction(self):
         with tempfile.TemporaryDirectory() as directory:
             guardian = exclusive.Guardian(Path(directory) / "state.json", None)
-            with patch.object(exclusive, "outputs", return_value=[output()]), patch.object(guardian, "script", return_value=[]), patch.object(exclusive, "atomic_save", side_effect=OSError("disk full")), patch.object(exclusive, "doctor") as doctor:
+            with patch.object(exclusive, "outputs", return_value=[output()]), patch.object(guardian, "script", return_value=[]) as script, patch.object(exclusive, "atomic_save", side_effect=OSError("disk full")), patch.object(exclusive, "doctor") as doctor:
                 with self.assertRaises(OSError):
                     guardian.prepare()
                 self.assertIsNone(guardian.state)
+                script.assert_called_once()  # Only the read-only window snapshot.
                 doctor.assert_not_called()
 
     def test_rejected_exact_restore_falls_back_and_retains_snapshot(self):
@@ -202,7 +209,181 @@ class ExclusiveTest(unittest.TestCase):
             observed = []
             with patch.object(guardian, "unload"), patch.object(exclusive, "outputs", return_value=[output()]), patch.object(exclusive, "doctor"), patch.object(guardian, "script", return_value=True), patch.object(exclusive, "sync_directory", side_effect=lambda _: observed.append(path.exists())):
                 guardian.restore()
-            self.assertEqual(observed, [True, True, False])
+            self.assertEqual(observed, [True, True, True, False])
+
+    def test_output_phase_retains_snapshot_and_defers_final_window_configures(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.json"
+            exclusive.atomic_save(path, recovery_state())
+            guardian = exclusive.Guardian(path, None)
+            with patch.object(guardian, "unload"), patch.object(exclusive, "outputs", return_value=[output()]), patch.object(exclusive, "doctor"), patch.object(guardian, "restore_windows") as windows:
+                guardian.restore(finish=False)
+            windows.assert_not_called()
+            self.assertTrue(path.exists())
+            self.assertEqual(json.loads(path.read_text())["output_recovery"], "exact")
+
+    def test_completed_windows_are_not_replayed_after_another_window_fails(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.json"
+            state = recovery_state()
+            state["windows"].append(dict(state["windows"][0], id="still-pending"))
+            exclusive.atomic_save(path, state)
+            guardian = exclusive.Guardian(path, None)
+            with patch.object(guardian, "script", return_value={"completed": ["saved-window"], "mismatches": ["still-pending"]}):
+                with self.assertRaisesRegex(RuntimeError, "Window restore incomplete"):
+                    guardian.restore_windows(guardian.state)
+            restarted = exclusive.Guardian(path, None)
+            with patch.object(restarted, "script", return_value=True) as script:
+                restarted.restore_windows(restarted.state)
+            declaration = script.call_args.args[0].split(";\n", 1)[0]
+            self.assertNotIn('"id": "saved-window"', declaration)
+            self.assertIn('"id": "still-pending"', declaration)
+            self.assertCountEqual(restarted.state["window_recovery"], ["saved-window", "still-pending"])
+
+    def test_unsettled_normal_geometry_rolls_back_before_discarding_snapshot(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.json"
+            guardian = exclusive.Guardian(path, None)
+            with patch.object(exclusive, "outputs", return_value=[output()]), patch.object(guardian, "unload"), patch.object(guardian, "script", side_effect=[[], None, True]):
+                with self.assertRaisesRegex(RuntimeError, "Normal window geometry snapshot did not converge"):
+                    guardian.prepare()
+            self.assertIsNone(guardian.state)
+            self.assertFalse(path.exists())
+
+    def test_snapshot_timeout_has_durable_originals_and_rolls_back(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.json"
+            guardian = exclusive.Guardian(path, None)
+            rows = recovery_state()["windows"]
+            rows[0]["maximized"] = 3
+            calls = []
+
+            def script(code):
+                calls.append(code)
+                if len(calls) == 1:
+                    return rows
+                durable = json.loads(path.read_text())
+                self.assertTrue(durable["snapshot_pending"])
+                self.assertEqual(durable["windows"], rows)
+                if len(calls) == 2:
+                    raise RuntimeError("KWin script did not acknowledge its operation")
+                return True
+
+            with patch.object(exclusive, "outputs", return_value=[output()]), patch.object(guardian, "unload"), patch.object(guardian, "script", side_effect=script), patch.object(exclusive, "doctor") as doctor:
+                with self.assertRaisesRegex(RuntimeError, "did not acknowledge"):
+                    guardian.prepare()
+                doctor.assert_not_called()
+            self.assertEqual(len(calls), 3)
+            self.assertIsNone(guardian.state)
+            self.assertFalse(path.exists())
+
+    def test_interrupted_snapshot_survives_failed_rollback_and_restart(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.json"
+            guardian = exclusive.Guardian(path, None)
+            with patch.object(exclusive, "outputs", return_value=[output()]), patch.object(guardian, "unload"), patch.object(guardian, "script", side_effect=[recovery_state()["windows"], RuntimeError("timeout"), False]):
+                with self.assertRaisesRegex(RuntimeError, "snapshot rollback incomplete"):
+                    guardian.prepare()
+            self.assertTrue(json.loads(path.read_text())["snapshot_pending"])
+            restarted = exclusive.Guardian(path, None)
+            with self.assertRaisesRegex(RuntimeError, "Previous recovery is incomplete"):
+                restarted.prepare()
+            with patch.object(restarted, "unload"), patch.object(restarted, "script", return_value=True), patch.object(exclusive, "doctor") as doctor:
+                restarted.restore()
+                doctor.assert_not_called()
+            self.assertIsNone(restarted.state)
+            self.assertFalse(path.exists())
+
+    @unittest.skipUnless(shutil.which("node"), "JavaScript replay requires node")
+    def test_stateful_windows_keep_normal_rectangle_after_recovery_and_state_exit(self):
+        """Replay capture, timeout/unload/close/error rollback and later state exit."""
+        with tempfile.TemporaryDirectory() as directory:
+            guardian = exclusive.Guardian(Path(directory) / "state.json", None)
+            with patch.object(exclusive, "outputs", return_value=[output()]), patch.object(guardian, "script", return_value=[]) as script:
+                guardian.prepare()
+            snapshot = script.call_args_list[0].args[0]
+            prepare = "var rows=result;\n" + script.call_args.args[0].split(";\n", 1)[1]
+            guardian.state["windows"] = recovery_state()["windows"]
+            with patch.object(guardian, "script", return_value=True) as script:
+                guardian.rollback_snapshot()
+            rollback = "var SAVED=durableRows;\n" + script.call_args.args[0].split(";\n", 1)[1]
+            saved = recovery_state()
+            with patch.object(guardian, "script", return_value=True) as script:
+                guardian.restore_windows(saved)
+            restore = script.call_args.args[0].split(";\n", 1)[1]
+            for maximized, fullscreen, scenario in [(m, f, s) for m, f in [(1, False), (2, False), (3, False), (0, True), (3, True)]
+                                                    for s in ("restore", "timeout-before-capture", "timeout-after-capture", "closed", "script-error")]:
+                with self.subTest(maximized=maximized, fullscreen=fullscreen, scenario=scenario):
+                    replay = r"""
+const assert=require('node:assert/strict');
+const input=JSON.parse(require('node:fs').readFileSync(0,'utf8'));
+const normal={x:150,y:100,width:600,height:400}, bounds={x:100,y:0,width:1920,height:1080};
+const copy=g=>({...g});
+let geometry=copy(normal), normalRestore=copy(normal), fullscreenRestore=copy(normal), result, readError=false;
+const target={name:'DP-1'}, timers=[];
+const w={internalId:'saved-window',output:target,maximizeMode:0,fullScreen:false,minimized:false,
+    desktops:[],activities:[],deleted:false,normalWindow:true,
+    get frameGeometry(){if(readError){readError=false;throw Error('capture failure');}return copy(geometry);},set frameGeometry(g){geometry=copy(g);},
+    setMaximize(v,h){
+        const old=this.maximizeMode, mode=Number(v)|Number(h)*2;
+        if(old===mode) return;
+        if(!(old&1)){normalRestore.y=geometry.y;normalRestore.height=geometry.height;}
+        if(!(old&2)){normalRestore.x=geometry.x;normalRestore.width=geometry.width;}
+        this.maximizeMode=mode;
+        geometry={x:mode&2?bounds.x:normalRestore.x,y:mode&1?bounds.y:normalRestore.y,
+                  width:mode&2?bounds.width:normalRestore.width,height:mode&1?bounds.height:normalRestore.height};
+    }};
+let full=false;
+Object.defineProperty(w,'fullScreen',{get(){return full;},set(value){
+    if(value===full) return;
+    if(value){fullscreenRestore=copy(geometry);geometry=copy(bounds);}else geometry=copy(fullscreenRestore);
+    full=value;
+}});
+const workspace={stackingOrder:[w],screens:[target],desktops:[],sendClientToScreen(w,s){w.output=s;}};
+function QTimer(){this.timeout={connect:f=>{this.callback=f;}};this.start=()=>timers.push(this);this.stop=()=>{this.stopped=true;};}
+function tick(){for(let n=0;n<130 && timers.some(t=>!t.stopped);++n) for(const t of timers) if(!t.stopped) t.callback();}
+function report(value){result=value;}
+function rect(g){return copy(g);}
+function windows(){return w.deleted ? [] : [w];}
+function screen(){return target;}
+w.setMaximize(!!(input.maximized&1),!!(input.maximized&2));w.fullScreen=input.fullscreen;
+eval(input.snapshot);
+const durableRows=JSON.parse(JSON.stringify(result)), originalBounds=copy(w.frameGeometry);
+eval(input.prepare);
+if(input.scenario.startsWith('timeout')) {
+    assert.equal(w.maximizeMode,0);assert.equal(w.fullScreen,false);
+    if(input.scenario==='timeout-after-capture') {timers[0].callback();timers[0].callback();}
+    timers.forEach(t=>t.stop()); // Unloading destroys the script's rollback timer.
+    eval(input.rollback);tick();
+    assert.equal(result,true);
+    assert.equal(w.maximizeMode,input.maximized);assert.equal(w.fullScreen,input.fullscreen);
+    assert.deepEqual(w.frameGeometry,originalBounds);
+    w.fullScreen=false;w.setMaximize(false,false);assert.deepEqual(w.frameGeometry,normal);
+} else if(input.scenario==='closed') {
+    w.deleted=true;tick();assert.deepEqual(result,[],'closed windows must not prevent convergence');
+} else if(input.scenario==='script-error') {
+    readError=true;tick();assert.equal(result,null);
+    assert.equal(w.maximizeMode,input.maximized);assert.equal(w.fullScreen,input.fullscreen);
+    assert.deepEqual(w.frameGeometry,originalBounds);
+} else {
+tick();
+assert.ok(Array.isArray(result),'snapshot must converge');
+const SAVED=result;
+assert.deepEqual(SAVED[0].normalGeometry,normal);
+// Phone routing can alter both the current size and the internal restore size.
+w.fullScreen=false;w.setMaximize(false,false);w.frameGeometry={x:0,y:0,width:320,height:700};
+w.setMaximize(true,true);
+eval(input.restore);tick();
+assert.deepEqual(result.mismatches,[]);
+assert.equal(w.maximizeMode,input.maximized);assert.equal(w.fullScreen,input.fullscreen);
+w.fullScreen=false;w.setMaximize(false,false);
+assert.deepEqual(w.frameGeometry,normal,'later state exit must restore original normal rectangle');
+}
+"""
+                    result = subprocess.run(["node", "-e", replay], input=json.dumps({"snapshot": snapshot, "prepare": prepare, "restore": restore,
+                                            "rollback": rollback, "scenario": scenario, "maximized": maximized, "fullscreen": fullscreen}),
+                                            capture_output=True, text=True, timeout=5)
+                    self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_plasma_waits_for_connectors_and_verifies_assignments(self):
         guardian = exclusive.Guardian(Path("/not-a-recovery-state-file"), None)

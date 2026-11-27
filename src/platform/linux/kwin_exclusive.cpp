@@ -4,6 +4,7 @@
  */
 #include "kwin_exclusive.h"
 
+#include "src/input.h"
 #include "src/logging.h"
 
 #include <algorithm>
@@ -95,6 +96,14 @@ namespace kwin {
       }
       if (byte == '\n') {
         auto response = nlohmann::json::parse(reply, nullptr, false);
+        cursor.reset();
+        if (response.is_object() && response.contains("pointer") && response["pointer"].is_object()) {
+          const auto &p = response["pointer"];
+          if (p.contains("x") && p.contains("y") && p.contains("width") && p.contains("height") &&
+              p["x"].is_number() && p["y"].is_number() && p["width"].is_number() && p["height"].is_number()) {
+            cursor = std::array<float, 4> {p["x"].get<float>(), p["y"].get<float>(), p["width"].get<float>(), p["height"].get<float>()};
+          }
+        }
         return response.is_object() && response.value("ok", false);
       }
       reply += byte;
@@ -151,6 +160,7 @@ namespace kwin {
       return false;
     }
     active = identity;
+    immediate_restore = false;
     return true;
   }
 
@@ -159,6 +169,7 @@ namespace kwin {
     if (active || stopping || !parked) {
       return nullptr;
     }
+    immediate_restore = false;
     active = parked.get();
     auto output = std::move(parked);
     changed.notify_all();
@@ -172,19 +183,45 @@ namespace kwin {
     }
     active = nullptr;
     parked = std::move(output);
+    const bool synchronous = delay == 0 && !immediate_restore;
+    delay = immediate_restore ? 0 : delay;
+    BOOST_LOG(info) << "[kwingrab] Exclusive capture teardown; reconnect grace=" << delay << "s";
     deadline = std::chrono::steady_clock::now() + std::chrono::seconds(delay);
-    if (delay == 0) {
+    // A normal disconnect wakes the joined lease worker immediately. Recovery
+    // must not block the capture destructor under the session's hang watchdog.
+    if (synchronous) {
       restore();
     }
     changed.notify_all();
   }
 
+  void exclusive_t::session_stopping(bool rotation) {
+    std::lock_guard lock(mutex);
+    immediate_restore = !rotation;
+    if (parked && immediate_restore) {
+      deadline = std::chrono::steady_clock::now();
+      changed.notify_all();
+    }
+  }
+
   void exclusive_t::restore() {
-    if (!request(R"({"action":"restore"})")) {
+    const auto started = std::chrono::steady_clock::now();
+    // Remove the virtual wl_output after physical scanouts return, before final
+    // window configures. Chromium may otherwise retain its phone work-area bound.
+    const bool outputs_restored = request(R"({"action":"restore-outputs"})");
+    parked.reset();
+    if (!outputs_restored || !request(R"({"action":"restore"})")) {
       BOOST_LOG(error) << "[kwingrab] Exclusive restore incomplete; guardian/saved snapshot retained for emergency recovery";
       disconnect();
     }
     parked.reset();
+    if (cursor) {
+      const auto [x, y, width, height] = *cursor;
+      input::position_cursor({0, 0, static_cast<int>(width), static_cast<int>(height), static_cast<int>(width), static_cast<int>(height)}, x, y);
+      cursor.reset();
+    }
+    BOOST_LOG(info) << "[kwingrab] Exclusive desktop recovery finished in "
+                    << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started).count() << "ms";
   }
 
   void exclusive_t::run() {

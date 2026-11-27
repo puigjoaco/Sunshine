@@ -23,10 +23,10 @@ extern "C" {
 }
 
 // local includes
+#include "camera.h"
 #include "config.h"
 #include "display_device.h"
 #include "globals.h"
-#include "camera.h"
 #include "input.h"
 #include "logging.h"
 #include "microphone.h"
@@ -38,6 +38,9 @@ extern "C" {
 #include "system_tray.h"
 #include "thread_safe.h"
 #include "utility.h"
+#ifdef SUNSHINE_BUILD_KWIN
+  #include "platform/linux/kwin_exclusive.h"
+#endif
 
 constexpr int IDX_START_A = 0;  ///< Control-stream message index for the first stream-start packet.
 constexpr int IDX_START_B = 1;  ///< Control-stream message index for the second stream-start packet.
@@ -557,6 +560,8 @@ namespace stream {
     } control;  ///< Runtime state for the encrypted GameStream control channel.
 
     std::uint32_t launch_session_id;  ///< RTSP launch-session ID associated with this stream.
+    crypto::aes_t rotation_key;  ///< Ephemeral launch key authenticating a rotation hint.
+    std::atomic<std::int64_t> rotation_until_ms {0};  ///< Hint expires two seconds after acknowledgment.
     std::string client_cert;  ///< PEM certificate for the paired client owning the stream.
     std::string input_session_id;  ///< Stable client identity used to retain input devices across resume.
 
@@ -766,7 +771,15 @@ namespace stream {
         return;
       }
 
-      session->pingTimeout = std::chrono::steady_clock::now() + config::stream.ping_timeout;
+      // Once a control peer exists, a missing heartbeat should not strand the
+      // exclusive desktop for the general-purpose ten-second startup timeout.
+      auto timeout = config::stream.ping_timeout;
+#ifdef SUNSHINE_BUILD_KWIN
+      if (config::video.virtual_display && config::video.virtual_display_mode == "exclusive") {
+        timeout = std::min(timeout, std::chrono::milliseconds(3000));
+      }
+#endif
+      session->pingTimeout = std::chrono::steady_clock::now() + timeout;
 
       switch (event.type) {
         case ENET_EVENT_TYPE_RECEIVE:
@@ -2241,6 +2254,17 @@ namespace stream {
     audio::capture(session->mail, session->config.audio, session);
   }
 
+  /**
+   * @brief Authenticate a reconnect hint against this stream's ephemeral launch key.
+   * @param expected Key negotiated for this stream.
+   * @param supplied Key from the authenticated HTTPS hint.
+   * @return True only for equal, complete AES-128 keys.
+   */
+  bool rotation_reconnect_key_matches(const crypto::aes_t &expected, const crypto::aes_t &supplied) {
+    return expected.size() == 16 && supplied.size() == 16 &&
+           CRYPTO_memcmp(expected.data(), supplied.data(), 16) == 0;
+  }
+
   namespace session {
     std::atomic_uint running_sessions;  ///< Running sessions.
 
@@ -2258,9 +2282,17 @@ namespace stream {
       return session.client_cert;
     }
 
-    /**
-     * @brief Stop the active streaming session and prevent new packets from being queued.
-     */
+    bool prepare_rotation_reconnect(session_t &session, const crypto::aes_t &key) {
+      if (session.state != state_e::RUNNING || !rotation_reconnect_key_matches(session.rotation_key, key)) {
+        return false;
+      }
+      const auto now = std::chrono::steady_clock::now().time_since_epoch() / 1ms;
+      session.rotation_until_ms.store(now + 2000);
+      BOOST_LOG(info) << "Rotation reconnect hint accepted (expires in 2s)";
+      return true;
+    }
+
+    /** @brief Stop the stream and choose the matching exclusive-output teardown policy. */
     void stop(session_t &session) {
       while_starting_do_nothing(session.state);
       auto expected = state_e::RUNNING;
@@ -2269,7 +2301,24 @@ namespace stream {
         return;
       }
 
-      session.shutdown_event->raise(true);
+      // Release remote grabs before either waking a parked output or stopping
+      // capture. A lingering remote drag must not look like local user activity.
+      auto finish_stop = [shutdown = session.shutdown_event, rotation_until = session.rotation_until_ms.load()] {
+#ifdef SUNSHINE_BUILD_KWIN
+        if (config::video.virtual_display && config::video.virtual_display_mode == "exclusive" && running_sessions == 1) {
+          const auto now = std::chrono::steady_clock::now().time_since_epoch() / 1ms;
+          kwin::exclusive_t::instance().session_stopping(now < rotation_until);
+        }
+#else
+        (void) rotation_until;
+#endif
+        shutdown->raise(true);
+      };
+      if (session.input) {
+        input::reset(session.input, std::move(finish_stop));
+      } else {
+        finish_stop();
+      }
     }
 
     /**
@@ -2298,9 +2347,6 @@ namespace stream {
       session.controlEnd.view();
       session.microphone.reset();
       session.camera.reset();
-      // Reset input on session stop to avoid stuck repeated keys
-      BOOST_LOG(debug) << "Resetting Input..."sv;
-      input::reset(session.input);
 
       // If this is the last session, invoke the platform callbacks
       if (--running_sessions == 0) {
@@ -2381,6 +2427,7 @@ namespace stream {
       session->shutdown_event = mail->event<bool>(mail::shutdown);
       session->launch_session_id = launch_session.id;
       session->client_cert = launch_session.client_cert;
+      session->rotation_key = launch_session.gcm_key;
       session->input_session_id = launch_session.client_cert.empty() ? launch_session.unique_id : launch_session.client_cert;
 
       session->config = config;

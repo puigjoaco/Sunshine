@@ -51,6 +51,8 @@ namespace platf::virtualhid {
 
     /** @brief Select one keyboard/pointer backend at stream start, releasing the previous source. */
     void begin_session();
+    /** @brief Release all keys and buttons owned by the selected source at disconnect. */
+    void end_session();
 
     std::unique_ptr<lvh::Runtime> runtime;  ///< libvirtualhid runtime.
     std::set<std::uint16_t> held_keys; ///< Keys held on the fallback device for release at session boundaries.

@@ -234,9 +234,10 @@ class Guardian:
 
     def __init__(self, path, reporter):
         self.path, self.reporter = path, reporter
+        self.pointer = None
         try:
             self.state = json.loads(path.read_text()) if path.exists() else None
-            if self.state is not None and (self.state.get("version", 1) not in (1, 2) or not isinstance(self.state.get("outputs"), list) or not isinstance(self.state.get("windows"), list)):
+            if self.state is not None and (self.state.get("version", 1) not in (1, 2, 3) or not isinstance(self.state.get("outputs"), list) or not isinstance(self.state.get("windows"), list)):
                 raise ValueError("Unknown snapshot format")
         except (ValueError, AttributeError):
             self.state = {"invalid": True}  # Preserve the file; still recover visible monitors.
@@ -269,21 +270,106 @@ class Guardian:
 
     def prepare(self):
         """Save originals before even creating the first virtual output."""
-        if self.state is not None and self.state.get("output_recovery"):
+        if self.state is not None and (self.state.get("output_recovery") or self.state.get("snapshot_pending")):
             raise RuntimeError("Previous recovery is incomplete; original snapshot retained")
         if self.state is None:
+            self.pointer = None
             saved = snapshot_outputs(outputs())
             rows = self.script("""
 report(windows().map(function(w) {
     return {id:String(w.internalId), output:w.output.name, geometry:rect(w.frameGeometry),
-            maximized:Number(w.maximizeMode), fullscreen:w.fullScreen, minimized:w.minimized};
+            maximized:Number(w.maximizeMode), fullscreen:w.fullScreen, minimized:w.minimized,
+            desktops:w.desktops.map(function(d){return d.id;}), activities:w.activities};
 }));
 """)
-            state = {"version": 2, "identity": recovery_identity(), "outputs": saved, "windows": rows,
-                     "plasma": plasma_snapshot(saved),
+            if not isinstance(rows, list):
+                raise RuntimeError("Window snapshot was not acknowledged")
+            state = {"version": 3, "identity": recovery_identity(), "outputs": saved, "windows": rows,
+                     "plasma": plasma_snapshot(saved), "snapshot_pending": True,
                      "guardian_pid": os.getpid(), "guardian_start": process_start(os.getpid())}
             atomic_save(self.path, state)
             self.state = state
+            try:
+                rows = self.script("var rows=" + json.dumps(rows) + ";\n" + """
+function alive(s) {return windows().find(function(w){return String(w.internalId)===s.id;});}
+function rollback() {
+    pending.forEach(function(s){var w=alive(s);if(!w) return;
+        w.setMaximize(!!(s.maximized & 1),!!(s.maximized & 2));w.fullScreen=s.fullscreen;
+    });
+}
+// KWin does not expose geometryRestore to scripts. Read it by leaving the
+// state temporarily, before any output transaction can alter the restore size.
+var pending=rows.filter(function(s){return s.maximized || s.fullscreen;}), phase=0, tries=0, stable={};
+if(!pending.length) report(rows.filter(alive));
+else {
+    var timer=new QTimer();timer.interval=50;timer.timeout.connect(function(){
+      try {
+        ++tries;
+        var ready=true;
+        pending.forEach(function(s){
+            var w=alive(s);if(!w) return;
+            var g=rect(w.frameGeometry), signature=JSON.stringify([g,Number(w.maximizeMode),w.fullScreen]);
+            stable[s.id]=stable[s.id] && stable[s.id].signature===signature ?
+                {signature:signature,count:stable[s.id].count+1} : {signature:signature,count:1};
+            if(stable[s.id].count<2 || (phase===0 ? w.fullScreen || Number(w.maximizeMode) :
+                w.fullScreen!==s.fullscreen || Number(w.maximizeMode)!==s.maximized)) ready=false;
+        });
+        if(!ready && tries<40) return; // Both phases fit the five-second script acknowledgement.
+        if(phase===0) {
+            pending.forEach(function(s){
+                var w=alive(s);if(!w) return;
+                if(ready) s.normalGeometry=rect(w.frameGeometry);
+            });
+            rollback();
+            phase=1;tries=0;stable={};return;
+        }
+        timer.stop();rollback();
+        report(ready && pending.filter(alive).every(function(s){return !!s.normalGeometry;}) ? rows.filter(alive) : null);
+      } catch(error) {timer.stop();rollback();report(null);}
+    });
+    try {
+        pending.forEach(function(s){var w=alive(s);if(!w) return;
+            w.fullScreen=false;w.setMaximize(false,false);
+        });
+        timer.start();
+    } catch(error) {rollback();report(null);}
+}
+""")
+                if not isinstance(rows, list):
+                    raise RuntimeError("Normal window geometry snapshot did not converge")
+                state["windows"] = rows
+                del state["snapshot_pending"]
+                atomic_save(self.path, state)
+            except Exception:
+                # script() unloads even on timeout; its timer cannot be our only
+                # rollback. The durable originals also survive a killed guardian.
+                self.state = json.loads(self.path.read_text())
+                self.restore()
+                raise
+
+    def rollback_snapshot(self):
+        """Undo only temporary state exits, preserving KWin's normal rectangles."""
+        result = self.script("var SAVED=" + json.dumps(self.state["windows"]) + ";\n" + """
+var tries=0,stable=0;
+function rollback() {
+    var current=windows(),ready=true;
+    SAVED.forEach(function(s){
+        if(!s.maximized && !s.fullscreen) return;
+        var w=current.find(function(w){return String(w.internalId)===s.id;});if(!w) return;
+        w.setMaximize(!!(s.maximized & 1),!!(s.maximized & 2));w.fullScreen=s.fullscreen;
+        var g=rect(w.frameGeometry),b=s.geometry;
+        if(Number(w.maximizeMode)!==s.maximized || w.fullScreen!==s.fullscreen ||
+           Math.abs(g.x-b.x)>=0.5 || Math.abs(g.y-b.y)>=0.5 ||
+           Math.abs(g.width-b.width)>=0.5 || Math.abs(g.height-b.height)>=0.5) ready=false;
+    });
+    stable=ready ? stable+1 : 0;
+    if(stable<2 && ++tries<60) return;
+    timer.stop();report(stable>=2);
+}
+var timer=new QTimer();timer.interval=50;timer.timeout.connect(rollback);timer.start();
+""")
+        if result is not True:
+            raise RuntimeError("Window snapshot rollback incomplete; original snapshot retained")
 
     def enter(self, name):
         """Make virtual primary; mirror it while every physical connector stays on."""
@@ -292,10 +378,24 @@ report(windows().map(function(w) {
         self.prepare()
         # Acknowledged before changing output policy. Keep routing new windows too.
         result = self.script("var TARGET=" + json.dumps(name) + ";\n" + """
+var pending={}, stable={}, attempts={};
+windows().forEach(function(w){pending[String(w.internalId)]=true;});
+workspace.windowAdded.connect(function(w){pending[String(w.internalId)]=true;});
 function move() {
     var target = screen(TARGET);
     if (!target) return;
     windows().forEach(function(w) {
+        var id=String(w.internalId);
+        if (!pending[id]) return;
+        if (w.move || w.resize) {delete pending[id];return;}
+        var before=rect(w.frameGeometry), viewport=target.geometry;
+        // Chromium can treat a normal-state phone resize as its new preferred
+        // size and then ignore normal restore configures. Maximization fits the
+        // phone without replacing that preferred normal rectangle.
+        if (!w.fullScreen && !Number(w.maximizeMode) && w.resizeable &&
+            (before.width>viewport.width || before.height>viewport.height)) {
+            w.setMaximize(true,true,before);
+        }
         if (w.output !== target) workspace.sendClientToScreen(w, target);
         if (!w.fullScreen && !Number(w.maximizeMode) && w.resizeable) {
             var g=rect(w.frameGeometry), area=target.geometry;
@@ -305,6 +405,12 @@ function move() {
             if (x!==g.x || y!==g.y || width!==g.width || height!==g.height)
                 w.frameGeometry={x:x, y:y, width:width, height:height};
         }
+        var actual=w.frameGeometry, bounds=target.geometry;
+        var fits=w.output===target && actual.x>=bounds.x && actual.y>=bounds.y &&
+                 actual.x+actual.width<=bounds.x+bounds.width+1 && actual.y+actual.height<=bounds.y+bounds.height+1;
+        stable[id]=fits ? (stable[id] || 0)+1 : 0;
+        attempts[id]=(attempts[id] || 0)+1;
+        if(stable[id]>=3 || attempts[id]>=30) delete pending[id];
     });
 }
 var timer = new QTimer(); timer.interval=100; timer.timeout.connect(move); timer.start();
@@ -438,24 +544,29 @@ print(JSON.stringify(missing.length===0 ? true : {mismatches:missing}));
             raise RuntimeError("No available physical desktop for degraded recovery")
         primary = min(available, key=lambda o: o["priority"] or 1000)["name"]
         self.move_plasma(primary)
-        result = self.script("var NAMES=" + json.dumps([o["name"] for o in available]) + ";var PRIMARY=" + json.dumps(primary) + ";" + """
+        result = self.script("var NAMES=" + json.dumps([o["name"] for o in available]) + ";var PRIMARY=" + json.dumps(primary) + ";var IDS=" + json.dumps([w["id"] for w in self.state["windows"]]) + ";" + """
 var tries=0;
 function recover() {
     var target=screen(PRIMARY);
-    if(target) windows().forEach(function(w){
+    if(target) windows().filter(function(w){return IDS.indexOf(String(w.internalId))>=0;}).forEach(function(w){
         if(NAMES.indexOf(w.output.name)<0) workspace.sendClientToScreen(w,target);
-        var area=w.output.geometry,g=rect(w.frameGeometry);
+        // sendClientToScreen is asynchronous for Wayland clients. Using
+        // w.output here can still clamp back onto the removed virtual output.
+        var area=target.geometry,g=rect(w.frameGeometry);
         var width=Math.min(g.width,area.width),height=Math.min(g.height,area.height);
         w.frameGeometry={x:Math.max(area.x,Math.min(g.x,area.x+area.width-width)),
                          y:Math.max(area.y,Math.min(g.y,area.y+area.height-height)),width:width,height:height};
     });
     if(++tries<10)return;
-    timer.stop();report(windows().every(function(w){return NAMES.indexOf(w.output.name)>=0;}));
+    timer.stop();
+    var missing=windows().filter(function(w){return IDS.indexOf(String(w.internalId))>=0 && NAMES.indexOf(w.output.name)<0;})
+        .map(function(w){return {id:String(w.internalId),output:w.output.name,geometry:rect(w.frameGeometry)};});
+    report(missing.length===0 ? true : {mismatches:missing});
 }
 var timer=new QTimer();timer.interval=100;timer.timeout.connect(recover);timer.start();
 """)
         if result is not True:
-            raise RuntimeError("Degraded window recovery incomplete; original snapshot retained")
+            raise RuntimeError("Degraded window recovery incomplete; original snapshot retained: " + json.dumps(result))
 
     def park_virtual_outputs(self):
         """Expose physical Plasma screens while retained virtual outputs still exist."""
@@ -477,11 +588,12 @@ var timer=new QTimer();timer.interval=100;timer.timeout.connect(recover);timer.s
         if args:
             doctor(args)
 
-    def restore(self):
+    def restore(self, finish=True):
         """Restore monitors first, then surviving windows; retain state on any failure."""
         if self.state is None:
             return
         saved = self.state
+        started = time.monotonic()
         if saved.get("identity") != recovery_identity():
             # Legacy, corrupt or foreign-session data cannot authorize a layout
             # change in the current desktop. Keep it for inspection, off the live path.
@@ -495,6 +607,13 @@ var timer=new QTimer();timer.interval=100;timer.timeout.connect(recover);timer.s
             self.unload()
         except Exception as error:
             print(f"exclusive: cannot unload script: {error}", file=sys.stderr)
+        if saved.get("snapshot_pending"):
+            self.rollback_snapshot()
+            self.path.unlink()
+            self.path.with_suffix(".js").unlink(missing_ok=True)
+            sync_directory(self.path.parent)
+            self.state = None
+            return
         if not saved.get("output_recovery"):
             # Persist intent before the transaction too: an interrupted or failed
             # marker write must never cause a later process to replay this layout.
@@ -533,49 +652,120 @@ var timer=new QTimer();timer.interval=100;timer.timeout.connect(recover);timer.s
             self.recover_desktop()
             raise RuntimeError("Degraded desktop recovery completed; original snapshot retained")
         self.park_virtual_outputs()
+        print(f"exclusive: physical outputs restored elapsed_ms={(time.monotonic()-started)*1000:.1f}", file=sys.stderr)
+        # The native owner releases its parked screencast between these phases.
+        # Clients must see the virtual output disappear before their final resize.
+        if not finish:
+            return
         plasma_error = panel_error
         try:
             self.restore_plasma()
         except Exception as error:
             plasma_error = error
-        result = self.script("var SAVED=" + json.dumps(saved["windows"]) + ";\n" + """
-var tries=0;
-function restore() {
-    var byId = {}; windows().forEach(function(w) { byId[String(w.internalId)] = w; });
-    SAVED.forEach(function(s) {
-        var w=byId[s.id], target=screen(s.output);
-        if (!w || !target) return;
-        // Recompute stateful geometry against the restored output/work area.
-        // KWin may otherwise retain a fullscreen rectangle from the virtual mode.
-        if (tries===0 && (w.fullScreen || Number(w.maximizeMode) || s.fullscreen || s.maximized)) {
-            w.fullScreen=false; w.setMaximize(false,false);
-        }
-        if (w.output !== target) workspace.sendClientToScreen(w, target);
-        if (w.fullScreen !== s.fullscreen) w.fullScreen=s.fullscreen;
-        if (Number(w.maximizeMode) !== s.maximized) w.setMaximize(!!(s.maximized & 1), !!(s.maximized & 2));
-        w.frameGeometry=s.geometry;
-        w.minimized=s.minimized;
-    });
-    if (++tries < 30) return;
-    timer.stop();
-    var mismatches=SAVED.filter(function(s) {
-        var w=byId[s.id]; if (!w) return false;
-        var g=w.frameGeometry;
-        return w.output.name!==s.output || Math.abs(g.x-s.geometry.x)>2 || Math.abs(g.y-s.geometry.y)>2 ||
-            Math.abs(g.width-s.geometry.width)>2 || Math.abs(g.height-s.geometry.height)>2;
-    }).map(function(s){var w=byId[s.id];return {id:s.id,expected:s.geometry,actual:rect(w.frameGeometry),output:w.output.name};});
-    report(mismatches.length===0 ? true : {mismatches:mismatches});
-}
-var timer=new QTimer(); timer.interval=100; timer.timeout.connect(restore); timer.start();
-""")
-        if result is not True:
-            raise RuntimeError("Window restore incomplete; original snapshot retained: " + json.dumps(result))
+        print(f"exclusive: Plasma restored elapsed_ms={(time.monotonic()-started)*1000:.1f}", file=sys.stderr)
+        self.pointer = self.cursor_target()
+        self.restore_windows(saved)
+        print(f"exclusive: windows restored elapsed_ms={(time.monotonic()-started)*1000:.1f}", file=sys.stderr)
         if plasma_error is not None:
             raise plasma_error
         self.path.unlink()
         self.path.with_suffix(".js").unlink(missing_ok=True)
         sync_directory(self.path.parent)
         self.state = None
+
+    def cursor_target(self):
+        """Suggest a primary-output position only when the cursor is off all physical outputs."""
+        return self.script("""
+var physical=workspace.screens.filter(function(s){return s.name.indexOf('Virtual-Sunshine-')!==0;});
+var p=workspace.cursorPos;
+if(!physical.length || physical.some(function(s){var g=s.geometry;return p.x>=g.x && p.y>=g.y && p.x<g.x+g.width && p.y<g.y+g.height;})) {
+    report(null);
+} else {
+    var primary=screen(PRIMARY) || physical[0],g=primary.geometry;
+    var width=Math.max.apply(null,physical.map(function(s){return s.geometry.x+s.geometry.width;}));
+    var height=Math.max.apply(null,physical.map(function(s){return s.geometry.y+s.geometry.height;}));
+    report({x:g.x+g.width/2,y:g.y+g.height/2,width:width,height:height});
+}
+""".replace('PRIMARY', json.dumps(min(self.state["outputs"], key=lambda o: o["priority"] or 1000)["name"])))
+
+    def restore_windows(self, saved):
+        """Restore surviving originals in phases, stopping early after verified convergence."""
+        completed = saved.get("window_recovery", [])
+        rows = [w for w in saved["windows"] if w["id"] not in completed]
+        if not rows:
+            return
+        result = self.script("var SAVED=" + json.dumps(rows) + ";\n" + """
+var tries=0, stable={}, done={}, skipped={};
+function sameRect(a,b) {
+    return Math.abs(a.x-b.x)<0.5 && Math.abs(a.y-b.y)<0.5 &&
+           Math.abs(a.width-b.width)<0.5 && Math.abs(a.height-b.height)<0.5;
+}
+function desktops(w) {return w.desktops.map(function(d){return d.id;}).sort().join(',');}
+function matches(w,s) {
+    return w.output.name===s.output && sameRect(w.frameGeometry,s.geometry) &&
+           w.fullScreen===s.fullscreen && Number(w.maximizeMode)===s.maximized && w.minimized===s.minimized &&
+           (!s.desktops || desktops(w)===s.desktops.slice().sort().join(',')) &&
+           (!s.activities || w.activities.slice().sort().join(',')===s.activities.slice().sort().join(','));
+}
+function restore() {
+    var byId={};windows().forEach(function(w){byId[String(w.internalId)]=w;});
+    SAVED.forEach(function(s){
+        if(done[s.id] || skipped[s.id]) return;
+        var w=byId[s.id], target=screen(s.output);
+        if(!w) {done[s.id]=true;return;} // Closed windows are never reopened.
+        if(!target) return;
+        // Respect a person dragging/resizing during recovery rather than racing them.
+        if(w.move || w.resize) {skipped[s.id]=true;return;}
+        if(tries===0) {
+            w.fullScreen=false;w.setMaximize(false,false);
+            if(s.desktops) {
+                var ids=s.desktops;
+                var available=workspace.desktops.filter(function(d){return ids.indexOf(d.id)>=0;});
+                if(!ids.length || available.length===ids.length) w.desktops=available;
+            }
+            if(s.activities) w.activities=s.activities;
+            w.minimized=s.minimized;
+            return;
+        }
+        if(tries===1) {
+            if(w.output!==target) workspace.sendClientToScreen(w,target);
+            // Stateful frame bounds are not the normal restore rectangle.
+            // Legacy snapshots lack it: retain KWin's restored normal geometry.
+            if(s.normalGeometry || (!s.maximized && !s.fullscreen))
+                w.frameGeometry=s.normalGeometry || s.geometry;
+            return;
+        }
+        if(tries===2) {
+            w.setMaximize(!!(s.maximized & 1),!!(s.maximized & 2));
+            w.fullScreen=s.fullscreen;
+        }
+        if(matches(w,s)) {
+            if((stable[s.id]=(stable[s.id] || 0)+1)>=2) done[s.id]=true;
+        } else {
+            stable[s.id]=0;
+            // Geometry writes while maximized/fullscreen race asynchronous state
+            // configures. Let KWin compute those rectangles from physical work areas.
+            if(!s.fullscreen && !s.maximized && tries%4===0) w.frameGeometry=s.geometry;
+        }
+    });
+    ++tries;
+    var pending=SAVED.filter(function(s){return !done[s.id] && !skipped[s.id];});
+    if(pending.length && tries<60) return;
+    timer.stop();
+    report({completed:Object.keys(done).concat(Object.keys(skipped)),mismatches:pending.map(function(s){
+        var w=byId[s.id];return {id:s.id,expected:s,actual:w ? {geometry:rect(w.frameGeometry),output:w.output.name,
+            maximized:Number(w.maximizeMode),fullscreen:w.fullScreen,minimized:w.minimized} : null};
+    })});
+}
+var timer=new QTimer();timer.interval=50;timer.timeout.connect(restore);timer.start();
+""")
+        if result is True:  # Also supports test doubles/older script adapters.
+            result = {"completed": [w["id"] for w in rows], "mismatches": []}
+        if isinstance(result, dict):
+            saved["window_recovery"] = list(dict.fromkeys(completed + result.get("completed", [])))
+            atomic_save(self.path, saved)
+        if not isinstance(result, dict) or result.get("mismatches"):
+            raise RuntimeError("Window restore incomplete; original snapshot retained: " + json.dumps(result))
 
     def restore_outputs(self, saved):
         """Apply and verify the original output layout once per recovery cycle."""
@@ -685,19 +875,24 @@ def main():
                             guardian.prepare()
                         elif request["action"] == "enter":
                             guardian.enter(request["output"])
+                        elif request["action"] == "restore-outputs":
+                            guardian.restore(finish=False)
                         elif request["action"] == "restore":
                             guardian.restore()
                         else:
                             raise RuntimeError("Unknown guardian action")
-                        response = {"ok": True}
+                        response = {"ok": True, "pointer": guardian.pointer}
                     except Exception as error:
                         print(f"exclusive: {error}", file=sys.stderr)
-                        # Recover the original desktop even if initialization fails.
-                        try:
-                            guardian.restore()
-                        except Exception as restore_error:
-                            print(f"exclusive restore: {restore_error}", file=sys.stderr)
-                        response = {"ok": False}
+                        # Initialization must recover immediately. A failed restore
+                        # retains progress for ExecStopPost/manual retry, without a
+                        # second full retry on the latency-sensitive teardown path.
+                        if request.get("action") not in ("restore", "restore-outputs"):
+                            try:
+                                guardian.restore()
+                            except Exception as restore_error:
+                                print(f"exclusive restore: {restore_error}", file=sys.stderr)
+                        response = {"ok": False, "pointer": guardian.pointer}
                     print(json.dumps(response), flush=True)
         except Exception as error:
             print(f"exclusive guardian: {error}", file=sys.stderr)

@@ -4,10 +4,12 @@
  */
 #pragma once
 
+#include <array>
 #include <chrono>
 #include <condition_variable>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 
@@ -48,6 +50,11 @@ namespace kwin {
      * @param delay Seconds of grace; zero restores synchronously on startup failure.
      */
     void finish(std::shared_ptr<void> output, int delay);
+    /**
+     * @brief Choose immediate teardown unless the ending stream requested a rotation reconnect.
+     * @param rotation True only for an authenticated, unexpired rotation hint.
+     */
+    void session_stopping(bool rotation);
 
   private:
     /** @brief Start the joined grace worker without changing any output. */
@@ -66,9 +73,11 @@ namespace kwin {
     std::shared_ptr<void> parked;  ///< Keeps the old virtual output alive while disconnected.
     const void *active = nullptr;  ///< Borrowed identity of the actual capture owner.
     std::chrono::steady_clock::time_point deadline;  ///< Pending restore deadline.
+    bool immediate_restore = false;  ///< Ordinary session ends bypass capture-reinit grace.
     bool stopping = false;  ///< Requests immediate exit restoration.
     int channel = -1;  ///< Private guardian lifeline; EOF means immediate restore.
     int guardian = -1;  ///< Child PID for bounded reaping.
+    std::optional<std::array<float, 4>> cursor;  ///< Physical recovery position and desktop bounds, if needed.
     std::thread worker;  ///< Grace-period timer; no detached Sunshine thread.
   };
 }  // namespace kwin

@@ -16,6 +16,7 @@ import tempfile
 import time
 
 ROOT = Path(__file__).resolve().parents[3]
+BUILD = Path(os.environ.get("SUNSHINE_TEST_BUILD_DIR", str(ROOT / "cmake-build-kwin")))
 HELPER = ROOT / "src_assets/linux/assets/kwin-exclusive.py"
 
 
@@ -60,6 +61,12 @@ def outer():
                 os.killpg(process.pid, signal.SIGTERM)
             except ProcessLookupError:
                 pass
+            artifacts = os.environ.get("SUNSHINE_TEST_ARTIFACTS_DIR")
+            if artifacts:
+                destination = Path(artifacts)
+                destination.mkdir(parents=True, exist_ok=True)
+                for source in Path(directory).glob("*.log"):
+                    shutil.copy2(source, destination / source.name)
 
 
 def inner():
@@ -70,7 +77,7 @@ def inner():
     source_helper = HELPER
     HELPER = directory / "kwin-exclusive.py"
     shutil.copy2(source_helper, HELPER)
-    shutil.copy2(ROOT / "cmake-build-kwin/sunshine-kwin-output", directory / "sunshine-kwin-output")
+    shutil.copy2(BUILD / "sunshine-kwin-output", directory / "sunshine-kwin-output")
     children = []
     groups = set()
     logs = []
@@ -122,17 +129,37 @@ def inner():
 
     def command(p, request, ok=True):
         import select
+        started = time.monotonic()
         p.stdin.write(json.dumps(request) + "\n")
         p.stdin.flush()
         assert select.select([p.stdout], [], [], 35)[0], "guardian response timeout"
         line = p.stdout.readline()
         assert line, (directory / "guardian.log").read_text()
         response = json.loads(line)
+        print(json.dumps({"action": request["action"], "ok": response["ok"], "elapsed_ms": round((time.monotonic()-started)*1000, 1)}), flush=True)
         assert response["ok"] is ok, (directory / "guardian.log").read_text()
+
+    def stateful_rectangles(label, change=""):
+        """Sample real frame rectangles after a private KWin state transition."""
+        path = directory / (label + ".js")
+        marker = "SUNSHINE_TEST_" + label + "="
+        path.write_text("""
+var windows=workspace.stackingOrder.filter(function(w){return /exclusive-test-[23]$/.test(w.caption);});
+""" + change + """
+var timer=new QTimer();timer.interval=150;timer.timeout.connect(function(){
+    timer.stop();var rows={};windows.forEach(function(w){var g=w.frameGeometry;
+        rows[w.caption]={x:g.x,y:g.y,width:g.width,height:g.height};
+    });print(""" + json.dumps(marker) + "+JSON.stringify(rows));});timer.start();")
+        index = run("qdbus6", "org.kde.KWin", "/Scripting", "org.kde.kwin.Scripting.loadScript", str(path), label)
+        run("qdbus6", "org.kde.KWin", "/Scripting/Script" + index, "org.kde.kwin.Script.run")
+        line = wait(lambda: next((line.split(marker, 1)[1] for line in (directory / "kwin.log").read_text().splitlines()
+                                  if marker in line), None), label)
+        run("qdbus6", "org.kde.KWin", "/Scripting", "org.kde.kwin.Scripting.unloadScript", label)
+        return json.loads(line)
 
     try:
         run("cc", "-o", str(directory / "owner"), str(Path(__file__).with_name("kwin_virtual_owner.c")),
-            "-I" + str(ROOT / "cmake-build-kwin/generated-src"), str(ROOT / "cmake-build-kwin/generated-src/zkde-screencast-unstable-v1.c"), "-lwayland-client")
+            "-I" + str(BUILD / "generated-src"), str(BUILD / "generated-src/zkde-screencast-unstable-v1.c"), "-lwayland-client")
         start("pipewire", ["pipewire"])
         start("kwin", ["kwin_wayland", "--virtual", "--width", "1280", "--height", "900", "--output-count", "2", "--socket", "exclusive-test", "--no-lockscreen", "--no-kactivities"])
         import dbus
@@ -146,28 +173,88 @@ def inner():
         saved = module.snapshot_outputs(original)
         start("plasmashell", ["plasmashell", "--no-respawn"])
         wait(lambda: bus.name_has_owner("org.kde.plasmashell"), "private Plasma shell")
+        wait(lambda: plasma()["panels"], "default Plasma panel initialized")
         run("qdbus6", "org.kde.plasmashell", "/PlasmaShell", "org.kde.PlasmaShell.evaluateScript",
             "if(panels().length===0){var p=new Panel; p.location='bottom'; p.addWidget('org.kde.plasma.icontasks');}panels().forEach(function(p){p.height=44;});")
         plasma_before = wait(lambda: plasma() if len(plasma()["desktops"]) == 2 and plasma()["panels"] else None, "two desktops and panel")
         app = directory / "windows.py"
-        app.write_text('''from PyQt6.QtWidgets import QApplication, QWidget\napp=QApplication([])\nwindows=[]\nfor i in range(4):\n w=QWidget();w.setWindowTitle("exclusive-test-"+str(i));w.resize(500,350);w.show();windows.append(w)\napp.exec()\n''')
+        app.write_text('''from PyQt6.QtWidgets import QApplication, QWidget\napp=QApplication([])\nwindows=[]\nfor i in range(5):\n w=QWidget();w.setWindowTitle("exclusive-test-"+str(i));w.resize(900,650);w.show();windows.append(w)\napp.exec()\n''')
         start("windows", [sys.executable, str(app)])
+        if os.environ.get("SUNSHINE_TEST_CHROMIUM") == "1":
+            start("chromium", ["google-chrome", "--no-sandbox", "--disable-gpu", "--no-first-run", "--no-default-browser-check",
+                               "--password-store=basic", "--ozone-platform=wayland", "--user-data-dir=" + str(directory / "chrome-profile"), "about:blank"])
+            ready = directory / "browser-ready.js"
+            ready.write_text("""
+var timer=new QTimer();timer.interval=100;timer.timeout.connect(function(){
+    if(workspace.stackingOrder.some(function(w){return String(w.resourceClass).indexOf('google-chrome')>=0;})) {
+        timer.stop();print('SUNSHINE_TEST_BROWSER_READY');
+    }
+});timer.start();
+""")
+            browser_script = run("qdbus6", "org.kde.KWin", "/Scripting", "org.kde.kwin.Scripting.loadScript", str(ready), "exclusive-test-browser-ready")
+            run("qdbus6", "org.kde.KWin", "/Scripting/Script" + browser_script, "org.kde.kwin.Script.run")
+            wait(lambda: "SUNSHINE_TEST_BROWSER_READY" in (directory / "kwin.log").read_text(), "private Chromium normal window")
+            run("qdbus6", "org.kde.KWin", "/Scripting", "org.kde.kwin.Scripting.unloadScript", "exclusive-test-browser-ready")
         time.sleep(.7)
         # Give each test window a distinct original connector and geometry.
         placement = directory / "place.js"
         placement.write_text("""
-workspace.stackingOrder.filter(function(w) { return w.caption.indexOf('exclusive-test-')===0; }).forEach(function(w) {
+workspace.stackingOrder.filter(function(w) { return w.caption.indexOf('exclusive-test-')===0 || String(w.resourceClass)==='google-chrome'; }).forEach(function(w) {
+    if(String(w.resourceClass)==='google-chrome') {
+        w.fullScreen=false;w.setMaximize(false,false);
+        workspace.sendClientToScreen(w,workspace.screens[0]);
+        w.frameGeometry={x:100,y:200,width:1000,height:650};
+        return;
+    }
     var i=Number(w.caption.slice(-1));
     workspace.sendClientToScreen(w, workspace.screens[i%2]);
-    w.frameGeometry={x:i%2 ? 1400 : 150, y:i%2 ? 120 : 220, width:500, height:350};
-    if(i===2) w.setMaximize(true,true);
-    if(i===3) w.fullScreen=true;
+    w.frameGeometry={x:i%2 ? 1400 : 150, y:i%2 ? 120 : 220, width:i===2 || i===3 ? 600 : 900, height:i===2 || i===3 ? 400 : 650};
+    if(i===4) w.minimized=true;
 });
 """)
         index = run("qdbus6", "org.kde.KWin", "/Scripting", "org.kde.kwin.Scripting.loadScript", str(placement), "exclusive-test-placement")
         run("qdbus6", "org.kde.KWin", "/Scripting/Script" + index, "org.kde.kwin.Script.run")
         time.sleep(.2)
         run("qdbus6", "org.kde.KWin", "/Scripting", "org.kde.kwin.Scripting.unloadScript", "exclusive-test-placement")
+        normal_rectangles = stateful_rectangles("original-normal")
+        assert len(normal_rectangles) == 2, normal_rectangles
+        apply_states = "windows.forEach(function(w){if(w.caption.endsWith('2')) w.setMaximize(true,true);else w.fullScreen=true;});"
+        stateful_bounds = stateful_rectangles("original-stateful", apply_states)
+        # Stall only capture's timer, so timeout unloads it while windows are
+        # unmaximized/out of fullscreen. Recovery must use the durable originals.
+        helper_source = HELPER.read_text()
+        stalled_source = helper_source.replace("        timer.start();\n    } catch(error)",
+                                               "        timer.interval=10000;timer.start();\n    } catch(error)", 1)
+        assert stalled_source != helper_source
+        snapshot = Path(os.environ["XDG_STATE_HOME"]) / "sunshine/kwin-exclusive.json"
+        HELPER.write_text(stalled_source)
+        try:
+            p = guardian()
+            command(p, {"action": "prepare"}, ok=False)
+            assert not snapshot.exists(), "timed-out snapshot was not rolled back"
+            assert stateful_rectangles("snapshot-timeout-rollback") == stateful_bounds
+            normal_after_timeout = stateful_rectangles("snapshot-timeout-normal", "windows.forEach(function(w){w.fullScreen=false;w.setMaximize(false,false);});")
+            assert normal_after_timeout == normal_rectangles
+            stateful_rectangles("snapshot-timeout-reapply", apply_states)
+            p.stdin.close()
+            assert p.wait(timeout=10) == 0
+            print("PASS: timeout unload mid-snapshot rolls back maximized/fullscreen states and preserves normal rectangles", flush=True)
+            # Kill the guardian after mutation, then exercise real ExecStopPost.
+            p = guardian()
+            p.stdin.write(json.dumps({"action": "prepare"}) + "\n")
+            p.stdin.flush()
+            wait(lambda: snapshot.exists() and json.loads(snapshot.read_text()).get("snapshot_pending"), "durable pre-mutation snapshot")
+            wait(lambda: stateful_rectangles("snapshot-kill-normal-" + str(time.monotonic_ns())) == normal_rectangles, "temporary state exit before guardian kill")
+            p.kill()
+            p.wait(timeout=5)
+            p.stdin.close()
+            run(sys.executable, str(HELPER), "restore")
+            assert not snapshot.exists()
+            assert stateful_rectangles("snapshot-kill-rollback") == stateful_bounds
+            assert module.restored(saved, state())
+            print("PASS: guardian killed mid-snapshot recovers original window states from disk", flush=True)
+        finally:
+            HELPER.write_text(helper_source)
         first = start("landscape", [str(directory / "owner"), "Sunshine-test-1", "3120", "1440"])
         wait(lambda: any(o["name"] == "Virtual-Sunshine-test-1" for o in state()), "landscape owned output")
         target = next(o for o in state() if o["name"] == "Virtual-Sunshine-test-1")
@@ -176,11 +263,11 @@ workspace.stackingOrder.filter(function(w) { return w.caption.indexOf('exclusive
         command(p, {"action": "enter", "output": "Virtual-Sunshine-test-1"})
         assert mirrors("Virtual-Sunshine-test-1")
         wait(plasma_exclusive, "Plasma desktop and panels on sole virtual output")
-        assert plasma()["heights"] == [70], plasma()
+        assert plasma()["heights"] == [70] * len(plasma_before["heights"]), plasma()
         snapshot = Path(os.environ["XDG_STATE_HOME"]) / "sunshine/kwin-exclusive.json"
         snapshot_before = snapshot.read_text()
-        assert [panel["height"] for panel in json.loads(snapshot_before)["plasma"]["panels"]] == [44]
-        assert len(json.loads(snapshot_before)["windows"]) >= 4
+        assert [panel["height"] for panel in json.loads(snapshot_before)["plasma"]["panels"]] == [44] * len(plasma_before["heights"])
+        assert len(json.loads(snapshot_before)["windows"]) >= (6 if os.environ.get("SUNSHINE_TEST_CHROMIUM") == "1" else 5)
         assert len({w["output"] for w in json.loads(snapshot_before)["windows"]}) >= 2
         print("PASS: virtual primary, physical connectors remain enabled and mirror its UUID", flush=True)
         print("PASS: Plasma desktop and panels follow sole virtual output", flush=True)
@@ -193,7 +280,7 @@ workspace.stackingOrder.filter(function(w) { return w.caption.indexOf('exclusive
         assert mirrors("Virtual-Sunshine-test-1")
         command(p, {"action": "enter", "output": "Virtual-Sunshine-test-1"})
         assert snapshot.read_text() == snapshot_before, "reconnect overwrote original snapshot"
-        assert plasma()["heights"] == [70], plasma()
+        assert plasma()["heights"] == [70] * len(plasma_before["heights"]), plasma()
         assert mirrors("Virtual-Sunshine-test-1")
         target = next(o for o in state() if o["name"] == "Virtual-Sunshine-test-1")
         assert module.mode_of(target)["size"] == {"width": 1440, "height": 3120}
@@ -204,6 +291,10 @@ workspace.stackingOrder.filter(function(w) { return w.caption.indexOf('exclusive
         first.stdin.close()
         first.wait(timeout=5)
         wait(lambda: plasma() == plasma_before, "original Plasma desktop/panel placement")
+        recovered_normal = stateful_rectangles("recovered-normal", "windows.forEach(function(w){w.fullScreen=false;w.setMaximize(false,false);});")
+        assert recovered_normal == normal_rectangles, (normal_rectangles, recovered_normal)
+        stateful_rectangles("reapply-stateful", apply_states)
+        print("PASS: later unmaximize and fullscreen exit preserve original 600x400 normal rectangles", flush=True)
         print("PASS: exact modes/positions/scale/priority and original window geometry restored", flush=True)
         second = start("portrait", [str(directory / "owner"), "Sunshine-test-2", "1440", "3120"])
         wait(lambda: any(o["name"] == "Virtual-Sunshine-test-2" for o in state()), "portrait owned output")
@@ -233,14 +324,15 @@ workspace.stackingOrder.filter(function(w) { return w.caption.indexOf('exclusive
         env = os.environ.copy()
         env["SUNSHINE_TEST_KWIN_EXCLUSIVE_OUTPUT"] = "Virtual-Sunshine-test-2"
         env["SUNSHINE_SKIP_CONFIG_MIGRATION"] = "1"
-        result = subprocess.run([str(ROOT / "cmake-build-kwin/tests/test_sunshine"),
+        result = subprocess.run([str(BUILD / "tests/test_sunshine"),
                                  "--gtest_filter=KwinExclusiveNestedTest.*"],
                                 env=env, cwd=directory, capture_output=True, text=True, timeout=30)
+        (directory / "native-lease.log").write_text(result.stdout + result.stderr)
         assert result.returncode == 0, result.stdout + result.stderr
         assert module.restored(saved, state()) and not snapshot.exists()
         assert plasma()["heights"] == plasma_before["heights"], plasma()
-        assert result.stdout.count("[       OK ]") == 3, result.stdout
-        print("PASS: C++ grace/resume/expiration, killed-guardian recovery, immediate exit restore (3 tests)", flush=True)
+        assert result.stdout.count("[       OK ]") == 5, result.stdout
+        print("PASS: C++ grace/resume/expiration, killed-guardian recovery, immediate exit restore (5 tests)", flush=True)
         # Live manual restore while the helper still owns the lock.
         p = guardian()
         command(p, {"action": "enter", "output": "Virtual-Sunshine-test-2"})
@@ -268,6 +360,8 @@ workspace.stackingOrder.filter(function(w) { return w.caption.indexOf('exclusive
             for row in fallback["windows"]:
                 info = run("qdbus6", "org.kde.KWin", "/KWin", "org.kde.KWin.getWindowInfo", row["id"])
                 values = dict(line.split(": ", 1) for line in info.splitlines() if ": " in line)
+                if values.get("minimized") == "true":
+                    continue  # Hidden windows need not render a phone-sized buffer.
                 if "x" in values:
                     if float(values["x"]) < 0 or float(values["y"]) < 0 or float(values["x"]) + float(values["width"]) > 578 or float(values["y"]) + float(values["height"]) > 1250:
                         return False
@@ -307,7 +401,7 @@ workspace.stackingOrder.filter(function(w) { return w.caption.indexOf('exclusive
         result = restore_cli()
         assert result.returncode != 0 and snapshot.exists()
         assert module.restored(newer, state()), "Completed recovery overwrote a newer layout"
-        assert plasma()["heights"] == [52], "Completed panel recovery overwrote a later thickness choice"
+        assert plasma()["heights"] == [52] * len(plasma_before["heights"]), "Completed panel recovery overwrote a later thickness choice"
         print("PASS: missing Plasma assignment retains state; repeated recovery preserves a newer output layout", flush=True)
         pending = json.loads(snapshot.read_text())
         pending["identity"]["boot"] = "previous-test-boot"
@@ -356,7 +450,7 @@ workspace.stackingOrder.filter(function(w) { return w.caption.indexOf('exclusive
         wait(lambda: any(str(o.get("info", {}).get("props", {}).get("application.name", "")).startswith("WirePlumber")
                          for o in json.loads(run("pw-dump"))), "private PipeWire policy manager")
         env["SUNSHINE_TEST_KWIN_CAPTURE_RECONNECT"] = "1"
-        result = subprocess.run([str(ROOT / "cmake-build-kwin/tests/test_sunshine"),
+        result = subprocess.run([str(BUILD / "tests/test_sunshine"),
                                  "--gtest_filter=KwinCaptureReconnectNestedTest.*"],
                                 env=env, cwd=directory, capture_output=True, text=True, timeout=30)
         assert result.returncode == 0 and "[       OK ]" in result.stdout, result.stdout + result.stderr

@@ -380,3 +380,46 @@ TEST_F(InputGamepadSessionTest, IgnoresPointerPositionBeforeDesktopBoundsAreKnow
   input::position_cursor({0, 0, 8240, 0, 8240, 0}, 6680, 720);
   EXPECT_EQ(context().mouse->last_submitted_event().kind, lvh::MouseEventKind::relative_motion);
 }
+
+TEST_F(InputGamepadSessionTest, DisconnectReleasesADeviceWhoseDelayedButtonUpWasCancelled) {
+  ASSERT_FALSE(task_pool.running());
+  config::input.mouse = true;
+  auto state = input::alloc(std::make_shared<safe::mail_raw_t>(), "delayed-release");
+  for (const bool release : {false, true}) {
+    NV_MOUSE_BUTTON_PACKET packet {};
+    packet.header.size = util::endian::big<std::uint32_t>(sizeof(packet) - sizeof(packet.header.size));
+    packet.header.magic = util::endian::little<std::uint32_t>(release ? MOUSE_BUTTON_UP_EVENT_MAGIC_GEN5 : MOUSE_BUTTON_DOWN_EVENT_MAGIC_GEN5);
+    packet.button = util::endian::big<decltype(packet.button)>(BUTTON_LEFT);
+    std::vector<std::uint8_t> bytes(sizeof(packet));
+    std::memcpy(bytes.data(), &packet, sizeof(packet));
+    input::passthrough(state, std::move(bytes));
+    input::testing::dispatch_mouse_packet(state);
+  }
+  // The scheduled button-up has not reached the actual source.
+  ASSERT_EQ(context().mouse->last_submitted_event().button, lvh::MouseButton::left);
+  ASSERT_TRUE(context().mouse->last_submitted_event().pressed);
+  const auto before = context().mouse->submit_count();
+  bool released_before_teardown = false;
+  input::reset(state, [&] {
+    released_before_teardown = context().mouse->submit_count() == before + 5 && !context().mouse->last_submitted_event().pressed;
+  });
+  EXPECT_TRUE(released_before_teardown);
+  EXPECT_EQ(context().mouse->submit_count(), before + 5);
+  EXPECT_FALSE(context().mouse->last_submitted_event().pressed);
+  EXPECT_EQ(context().mouse->last_submitted_event().button, lvh::MouseButton::extra);
+}
+
+TEST_F(InputGamepadSessionTest, StopRejectsLateInputUntilTheClientResumes) {
+  auto state = input::alloc(std::make_shared<safe::mail_raw_t>(), "late-packets");
+  auto packet = [] { return make_input_packet(UTF8_TEXT_EVENT_MAGIC, sizeof(std::uint32_t), sizeof(NV_INPUT_HEADER)); };
+  input::passthrough(state, packet());
+  ASSERT_EQ(input::testing::queued_input_packet_count(state), 1);
+  input::reset(state);
+  EXPECT_EQ(input::testing::queued_input_packet_count(state), 0);
+  input::passthrough(state, packet());
+  EXPECT_EQ(input::testing::queued_input_packet_count(state), 0);
+  auto resumed = input::alloc(std::make_shared<safe::mail_raw_t>(), "late-packets");
+  ASSERT_EQ(resumed, state);
+  input::passthrough(resumed, packet());
+  EXPECT_EQ(input::testing::queued_input_packet_count(resumed), 1);
+}

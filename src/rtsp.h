@@ -76,6 +76,12 @@ namespace rtsp_stream {
    * @param cert Certificate data or object used by the operation.
    */
   void terminate_sessions_by_cert(std::string_view cert);
+  /**
+   * @brief Arm rotation grace only on the running stream owning an ephemeral launch key.
+   * @param key Launch key from the authenticated client, never persisted or logged.
+   * @return True when a running stream was matched.
+   */
+  bool prepare_rotation_reconnect(const crypto::aes_t &key);
 
   /**
    * @brief Runs the RTSP server loop.

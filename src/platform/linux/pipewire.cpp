@@ -81,6 +81,7 @@ namespace pipewire {
     std::atomic<int> negotiated_height {0};  ///< Height negotiated with PipeWire for the stream.
     std::atomic<int> color_primaries {0};  ///< PipeWire color-primaries metadata for the stream.
     std::atomic<int> transfer_function {0};  ///< PipeWire transfer-function metadata for the stream.
+    std::atomic<bool> dmabuf {false};  ///< Whether the negotiated capture format uses DMA-BUF.
     std::atomic<bool> stream_dead {false};  ///< Whether the PipeWire stream has been destroyed.
     pw_stream_state previous_state;  ///< Previous PipeWire stream state reported by callbacks.
     pw_stream_state current_state;  ///< Current PipeWire stream state reported by callbacks.
@@ -236,7 +237,7 @@ namespace pipewire {
         {
           static_cast<int32_t>(stream_data.format.info.raw.max_framerate.num),
           static_cast<int32_t>(stream_data.format.info.raw.max_framerate.denom)
-      };
+        };
       int rate_comparison = av_cmp_q(negotiated_rate, requested_framerate);
       bool variable_rate = negotiated_rate.num == 0 && negotiated_rate.den == 1;
       bool pacing_required = variable_rate || rate_comparison > 0;
@@ -336,9 +337,8 @@ namespace pipewire {
         std::array<const struct spa_pod *, MAX_PARAMS> params;
 
         // Add preferred parameters for DMA-BUF with modifiers
-        // Use DMA-BUF for VAAPI, or for CUDA when the display GPU is NVIDIA (pure NVIDIA system).
-        // On hybrid GPU systems (Intel+NVIDIA), DMA-BUFs come from the Intel GPU and cannot
-        // be imported into CUDA, so we fall back to memory buffers in that case.
+        // CUDA interop requires an NVIDIA Wayland EGL display. A compositor
+        // using Intel/Mesa keeps the memory fallback even if NVENC is available.
         bool use_dmabuf = n_dmabuf_infos > 0 && (mem_type == platf::mem_type_e::vaapi ||
                                                  mem_type == platf::mem_type_e::vulkan ||
                                                  (mem_type == platf::mem_type_e::cuda && display_is_nvidia));
@@ -677,6 +677,11 @@ namespace pipewire {
       }
       if (spa_format_video_raw_parse(param, &d->format.info.raw) < 0) {
         return;
+      }
+      const bool dmabuf = spa_pod_find_prop(param, nullptr, SPA_FORMAT_VIDEO_modifier) != nullptr;
+      if (d->shared) {
+        // Publish before the dimensions that signal completed negotiation to init().
+        d->shared->dmabuf.store(dmabuf);
       }
 
       BOOST_LOG(info) << "[pipewire] Video format: "sv << d->format.info.raw.format;
@@ -1092,12 +1097,12 @@ namespace pipewire {
 
 #ifdef SUNSHINE_BUILD_CUDA
       if (mem_type == platf::mem_type_e::cuda) {
-        if (display_is_nvidia && n_dmabuf_infos > 0) {
-          // Display GPU is NVIDIA - can use DMA-BUF directly
+        if (display_is_nvidia && shared_state->dmabuf.load()) {
+          // Use the negotiated buffer type: the compositor may reject DMA-BUF
+          // and select the memory fallback even on an NVIDIA EGL display.
           return cuda::make_avcodec_gl_encode_device(width, height, 0, 0);
         } else {
-          // Hybrid system (Intel display + NVIDIA encode) - use memory buffer path
-          // DMA-BUFs from Intel GPU cannot be imported into CUDA
+          // Cross-GPU or compositor memory fallback: upload the captured pixels.
           return cuda::make_avcodec_encode_device(width, height, false);
         }
       }
@@ -1357,36 +1362,12 @@ namespace pipewire {
         return -1;
       }
 
-      // Detect if this is a pure NVIDIA system (not hybrid Intel+NVIDIA)
-      // On hybrid systems, the wayland compositor typically runs on Intel,
-      // so DMA-BUFs from portal will come from Intel and cannot be imported into CUDA.
-      // Check if Intel GPU exists - if so, assume hybrid system and disable CUDA DMA-BUF.
-      bool has_intel_gpu = std::ifstream("/sys/class/drm/card0/device/vendor").good() ||
-                           std::ifstream("/sys/class/drm/card1/device/vendor").good();
-      if (has_intel_gpu) {
-        // Read vendor IDs to check for Intel (0x8086)
-        auto check_intel = [](const std::string &path) {
-          if (std::ifstream f(path); f.good()) {
-            std::string vendor;
-            f >> vendor;
-            return vendor == "0x8086";
-          }
-          return false;
-        };
-        bool intel_present = check_intel("/sys/class/drm/card0/device/vendor") ||
-                             check_intel("/sys/class/drm/card1/device/vendor");
-        if (intel_present) {
-          BOOST_LOG(info) << "[pipewire] Hybrid GPU system detected (Intel + discrete) - CUDA will use memory buffers"sv;
-          display_is_nvidia = false;
-        } else {
-          // No Intel GPU found, check if NVIDIA is present
-          const char *vendor = eglQueryString(egl_display.get(), EGL_VENDOR);
-          if (vendor && std::string_view(vendor).contains("NVIDIA")) {
-            BOOST_LOG(info) << "[pipewire] Pure NVIDIA system - DMA-BUF will be enabled for CUDA"sv;
-            display_is_nvidia = true;
-          }
-        }
-      }
+      // The Wayland EGL display determines which formats can be imported.
+      // An installed Intel GPU does not imply that the compositor uses it.
+      const char *vendor = eglQueryString(egl_display.get(), EGL_VENDOR);
+      display_is_nvidia = vendor && std::string_view(vendor).contains("NVIDIA");
+      BOOST_LOG(info) << "[pipewire] Wayland EGL vendor: " << (vendor ? vendor : "unknown")
+                      << "; CUDA DMA-BUF " << (display_is_nvidia ? "available" : "disabled");
 
       if (eglQueryDmaBufFormatsEXT && eglQueryDmaBufModifiersEXT) {
         query_dmabuf_formats(egl_display.get());

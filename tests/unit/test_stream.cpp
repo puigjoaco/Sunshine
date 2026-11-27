@@ -17,9 +17,11 @@
 #include <vector>
 
 // local includes
+#include <src/crypto.h>
 #include <src/network.h>
 
 namespace stream {
+  bool rotation_reconnect_key_matches(const crypto::aes_t &expected, const crypto::aes_t &supplied);
   std::vector<uint8_t> concat_and_insert(uint64_t insert_size, uint64_t slice_size, const std::string_view &data1, const std::string_view &data2);
   std::optional<std::pair<std::uint16_t, std::string_view>> parse_control_packet(const ENetPacket &packet);
 }  // namespace stream
@@ -84,4 +86,15 @@ TEST(ControlPacketTests, AcceptsTypeAndPayload) {
   ASSERT_TRUE(message);
   EXPECT_EQ(message->first, 0x0206);
   EXPECT_EQ(message->second, "abc");
+}
+
+TEST(RotationReconnectTest, RequiresTheExactCurrentLaunchKey) {
+  const crypto::aes_t expected(16, 0x80);
+  EXPECT_TRUE(stream::rotation_reconnect_key_matches(expected, expected));
+  auto other = expected;
+  other[15] ^= 1;
+  EXPECT_FALSE(stream::rotation_reconnect_key_matches(expected, other));
+  EXPECT_FALSE(stream::rotation_reconnect_key_matches({}, {}));
+  EXPECT_FALSE(stream::rotation_reconnect_key_matches(expected, crypto::aes_t(15, 0x80)));
+  EXPECT_FALSE(stream::rotation_reconnect_key_matches(crypto::aes_t(17, 0x80), expected));
 }

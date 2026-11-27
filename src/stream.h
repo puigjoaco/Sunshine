@@ -75,6 +75,13 @@ namespace stream {
      */
     void stop(session_t &session);
     /**
+     * @brief Arm a short rotation-only reconnect hint for the stream owning this launch key.
+     * @param session Running stream to match.
+     * @param key Ephemeral 128-bit launch key supplied over authenticated HTTPS.
+     * @return True if the live stream owns this key and the hint was armed.
+     */
+    bool prepare_rotation_reconnect(session_t &session, const crypto::aes_t &key);
+    /**
      * @brief Wait for worker threads owned by the session to exit.
      *
      * @param session Active streaming or pairing session for the request.

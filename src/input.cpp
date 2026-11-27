@@ -164,7 +164,7 @@ namespace input {
 
   static task_pool_util::TaskPool::task_id_t key_press_repeat_id {};
   static std::unordered_map<key_press_id_t, bool> key_press {};
-  static std::array<std::uint8_t, 5> mouse_press {};
+  static std::array<std::uint8_t, 6> mouse_press {};
 
   static platf::input_t platf_input;
 #ifdef SUNSHINE_TESTS
@@ -298,6 +298,7 @@ namespace input {
 
     std::list<std::vector<uint8_t>> input_queue;  ///< Validated input packets waiting for processing.
     std::mutex input_queue_lock;  ///< Input queue lock.
+    bool accepting_input = true;  ///< Guarded by input_queue_lock; stop rejects late control packets.
 
     thread_pool_util::ThreadPool::task_id_t mouse_left_button_timeout;  ///< Mouse left button timeout.
 
@@ -2138,6 +2139,9 @@ namespace input {
 
     {
       std::lock_guard<std::mutex> lg(input->input_queue_lock);
+      if (!input->accepting_input) {
+        return;
+      }
       input->input_queue.push_back(std::move(input_data));
     }
     task_pool.push(passthrough_next_message, input);
@@ -2203,17 +2207,33 @@ namespace input {
     reset_mouse_buttons();
     reset_keyboard_keys();
     reset_gamepads(input);
+    // A delayed absolute-pointer button-up may have been cancelled after the
+    // logical state was cleared. Release what the selected device actually owns.
+    if (platf_input) {
+      platf::virtualhid::get_input_context(platf_input).end_session();
+    }
   }
 
   /**
    * @brief Reset the object to its initial empty state.
    */
-  void reset(std::shared_ptr<input_t> &input) {
+  void reset(std::shared_ptr<input_t> &input, std::function<void()> completed) {
     task_pool.cancel(key_press_repeat_id);
     task_pool.cancel(input->mouse_left_button_timeout);
 
-    // Ensure input is synchronous, by using the task_pool
-    task_pool.push(reset_input_state, input);
+    // Close ingress before the ordered release; old control packets must not
+    // recreate a held button after capture starts restoring the desktop.
+    {
+      std::lock_guard lock(input->input_queue_lock);
+      input->accepting_input = false;
+      input->input_queue.clear();
+    }
+    dispatch_input_task([input, completed = std::move(completed)] {
+      reset_input_state(input);
+      if (completed) {
+        completed();
+      }
+    });
   }
 
   void terminate_gamepads() {
@@ -2345,6 +2365,11 @@ namespace input {
       dispatch_input_task([input, mail = std::move(mail)]() {
         rebind_input(input, mail);
       });
+    }
+
+    {
+      std::lock_guard lock(input->input_queue_lock);
+      input->accepting_input = true;
     }
 
     // Workaround to ensure new frames will be captured when a client connects
