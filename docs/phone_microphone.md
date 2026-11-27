@@ -23,8 +23,9 @@ The sender increments the sequence for both audio and stop. The host rejects
 old/duplicate frames and reordered stops, and compares capture timestamp deltas
 without requiring synchronized clocks. A 40–80 ms adaptive reorder buffer uses
 Opus PLC for missing frames and bounds pending audio to eight packets. The PCM
-ring holds at most 40 ms. A 500 ms input timeout covers lost stop packets and
-client crashes. Decoding and PipeWire/Pulse work run outside the ENet thread.
+ring holds at most 40 ms and evicts a complete 20 ms frame on overrun to leave
+headroom for graph quanta, rather than repeatedly clipping small sample ranges.
+A 500 ms input timeout covers lost stop packets and client crashes. Decoding and PipeWire/Pulse work run outside the ENet thread.
 
 The native `PW_DIRECTION_OUTPUT` source has `media.class=Audio/Source`, stable
 name `sunshine_microphone`, and description **Sunshine Microphone**. One session
@@ -43,7 +44,15 @@ source names are written to a state file.
 The Android sender uses `VOICE_RECOGNITION`, requests platform AEC/NS where
 available, and uses MediaCodec Opus at 40 kbps VBR. Recognition was selected
 after device probes initialized both sources and effects successfully but
-communication returned silence. Encoder availability is checked before capture;
+communication returned silence. For negotiated microphone sessions, the client
+disables ENet's RTT-based
+unreliable packet deceleration. At its minimum, that throttle can silently discard
+31 of 32 frames locally even when `enet_peer_send()` succeeds, leaving 640 ms
+between 20 ms voice packets. Audio stays unreliable and unsequenced; no queued
+speech is retransmitted. AudioRecord starts before codec initialization so hardware
+warm-up overlaps encoder setup on unmute.
+
+Encoder availability is checked before capture;
 an unavailable Android 10+ Opus encoder produces a clear message.
 
 Focused tests:
@@ -56,7 +65,7 @@ SUNSHINE_TEST_MICROPHONE_INTEGRATION=1 cmake-build-kwin/tests/test_sunshine \
 ```
 
 The opt-in integration test temporarily changes the desktop default microphone,
-feeds synthetic Opus, records the native source with `pw-record`, checks a 1 kHz
-tone, measures packet-to-record latency, and checks recording continuity across
-a receiver reconnect. Run it only in an idle local PipeWire session. It requires
+feeds synthetic Opus, records the native source with `pw-record`, checks a 733 Hz
+tone (which exposes whole-frame skips), measures packet-to-record latency, and
+checks recording continuity across a receiver reconnect. Run it only in an idle local PipeWire session. It requires
 `pw-record` in PATH and does not record a physical microphone.

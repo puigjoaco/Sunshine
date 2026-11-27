@@ -182,7 +182,7 @@ namespace microphone {
       /** @brief Clear queued speech immediately on mute or disconnect, preserving app links. */
       void silence() {
         std::lock_guard lock(mutex);
-        read_pos = write_pos;
+        pcm.clear();
       }
 
       /**
@@ -191,12 +191,7 @@ namespace microphone {
        */
       void write(const int16_t *samples) {
         std::lock_guard lock(mutex);
-        for (int i = 0; i < frame_samples; ++i) {
-          if (write_pos - read_pos == pcm.size()) {
-            ++read_pos;
-          }
-          pcm[write_pos++ % pcm.size()] = samples[i];
-        }
+        pcm.write(samples);
       }
 
     private:
@@ -222,9 +217,7 @@ namespace microphone {
           auto count = std::min<uint64_t>(requested, d.maxsize / sizeof(int16_t));
           auto out = static_cast<int16_t *>(d.data);
           std::lock_guard lock(self.mutex);
-          for (size_t i = 0; i < count; ++i) {
-            out[i] = self.read_pos < self.write_pos ? self.pcm[self.read_pos++ % self.pcm.size()] : 0;
-          }
+          self.pcm.read(out, count);
           d.chunk->offset = 0;
           d.chunk->stride = sizeof(int16_t);
           d.chunk->size = count * sizeof(int16_t);
@@ -238,9 +231,7 @@ namespace microphone {
       pw_stream *stream = nullptr;  ///< Owned PipeWire stream.
       bool running = false;  ///< Loop lifecycle.
       std::mutex mutex;  ///< Protects the small PCM ring (not held during decode).
-      std::array<int16_t, 1920> pcm {};  ///< At most 40 ms queued PCM.
-      uint64_t read_pos = 0;  ///< Monotonic ring read cursor.
-      uint64_t write_pos = 0;  ///< Monotonic ring write cursor.
+      pcm_queue_t pcm;  ///< Bounded PCM queue, protected by mutex.
     };
 
     /**

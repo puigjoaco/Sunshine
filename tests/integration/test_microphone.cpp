@@ -35,10 +35,13 @@ TEST(MicrophoneIntegration, SyntheticOpusBecomesARecordableSine) {
   std::array<int16_t, 960> samples {};
   std::array<unsigned char, 1024> encoded {};
   auto begin = microphone::clock::now();
+  // A non-integer number of cycles per frame exposes whole-frame skips as well
+  // as partial PCM trims after reconnect; a 1 kHz tone can hide 20 ms skips.
+  constexpr double frequency = 733;
   // Feed for 400 ms before attaching pw-record so discovery and default-source setup settle.
   auto feed = [&](int seq) {
     for (int i = 0; i < 960; ++i) {
-      samples[i] = (seq >= 20 && seq < 50) ? 0 : 12000 * std::sin(2 * std::numbers::pi * 1000 * (seq * 960 + i) / 48000.0);
+      samples[i] = (seq >= 20 && seq < 50) ? 0 : 12000 * std::sin(2 * std::numbers::pi * frequency * (seq * 960 + i) / 48000.0);
     }
     int size = opus_encode(encoder, samples.data(), 960, encoded.data(), encoded.size());
     EXPECT_GT(size, 0);
@@ -112,13 +115,13 @@ TEST(MicrophoneIntegration, SyntheticOpusBecomesARecordableSine) {
   size_t last_half_second = recorded.size() - 24000;
   for (size_t i = last_half_second; i < recorded.size(); ++i) {
     power += double(recorded[i]) * recorded[i];
-    real += recorded[i] * std::cos(2 * std::numbers::pi * 1000 * i / 48000.0);
-    imag += recorded[i] * std::sin(2 * std::numbers::pi * 1000 * i / 48000.0);
+    real += recorded[i] * std::cos(2 * std::numbers::pi * frequency * i / 48000.0);
+    imag += recorded[i] * std::sin(2 * std::numbers::pi * frequency * i / 48000.0);
   }
   auto count = recorded.size() - last_half_second;
   double rms = std::sqrt(power / count);
   double tone_fraction = 2 * (real * real + imag * imag) / (count * power);
-  std::cout << "Microphone capture samples=" << recorded.size() << " RMS=" << rms << " 1kHz_power_fraction=" << tone_fraction << std::endl;
+  std::cout << "Microphone capture samples=" << recorded.size() << " RMS=" << rms << " 733Hz_power_fraction=" << tone_fraction << std::endl;
   ASSERT_GT(detected.load(), 0);
   auto latency = std::chrono::duration<double, std::milli>(microphone::clock::duration(detected.load()) - tone_sent.time_since_epoch()).count();
   std::cout << "Microphone synthetic packet-to-pw-record latency_ms=" << latency << std::endl;

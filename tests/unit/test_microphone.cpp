@@ -118,3 +118,57 @@ TEST(Microphone, SequenceWrapAndBoundedBurstRecovery) {
   ASSERT_TRUE(recovered);
   EXPECT_EQ(*recovered, "opus");
 }
+
+TEST(Microphone, PcmClearsSpeechAndZeroFillsGraphUnderruns) {
+  microphone::pcm_queue_t q;
+  std::array<int16_t, microphone::frame_samples> frame;
+  frame.fill(123);
+  q.write(frame.data());
+  std::array<int16_t, 1200> output;
+  q.read(output.data(), output.size());
+  for (size_t i = 0; i < output.size(); ++i) {
+    EXPECT_EQ(output[i], i < frame.size() ? 123 : 0);
+  }
+  q.write(frame.data());
+  q.clear();
+  q.read(output.data(), output.size());
+  for (auto sample : output) {
+    EXPECT_EQ(sample, 0);
+  }
+}
+
+TEST(Microphone, PcmOverrunLeavesHeadroomForVariableGraphQuanta) {
+  microphone::pcm_queue_t q;
+  std::array<int16_t, microphone::frame_samples> input;
+  int16_t sample = 1;
+  auto write = [&] {
+    for (auto &value : input) {
+      value = sample++;
+    }
+    q.write(input.data());
+  };
+  // A recorder attaches after the source has accumulated the full 40 ms bound.
+  write();
+  write();
+  std::array<int16_t, 256> output;
+  int previous = 0;
+  int discontinuities = 0;
+  for (int time = 0; time < 24000; ++time) {
+    if (time % 960 == 1) {
+      write();
+    }
+    if (time % 256 == 0) {
+      q.read(output.data(), output.size());
+      for (auto value : output) {
+        ASSERT_GT(value, 0);
+        if (previous && value != previous + 1) {
+          ++discontinuities;
+          EXPECT_EQ(value - previous, microphone::frame_samples + 1);
+        }
+        previous = value;
+      }
+    }
+  }
+  // Evict one stale frame once; partial trims would keep clipping later quanta.
+  EXPECT_EQ(discontinuities, 1);
+}

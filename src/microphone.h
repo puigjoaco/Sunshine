@@ -4,6 +4,7 @@
  */
 #pragma once
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstdint>
 #include <deque>
@@ -197,6 +198,45 @@ namespace microphone {
     int stable = 0;  ///< Consecutive healthy outputs.
     clock::time_point start {};  ///< Prime deadline.
     clock::time_point last {};  ///< Most recent accepted audio packet arrival.
+  };
+
+  /** @brief Bounded PCM handoff between 20 ms decoding and variable PipeWire quanta; caller serializes access. */
+  class pcm_queue_t {
+  public:
+    /** @brief Discard queued speech immediately on mute or disconnect. */
+    void clear() {
+      read_pos = write_pos;
+    }
+
+    /**
+     * @brief Append a 20 ms frame, evicting a complete old frame on overrun.
+     * @param samples Exactly frame_samples mono signed 16-bit samples.
+     */
+    void write(const int16_t *samples) {
+      if (write_pos - read_pos + frame_samples > pcm.size()) {
+        // Leave headroom for graph quanta instead of repeatedly clipping a few samples.
+        read_pos += frame_samples;
+      }
+      for (int i = 0; i < frame_samples; ++i) {
+        pcm[write_pos++ % pcm.size()] = samples[i];
+      }
+    }
+
+    /**
+     * @brief Fill a graph quantum, zero-filling any underrun.
+     * @param output Destination with room for count signed 16-bit samples.
+     * @param count Number of samples requested by the graph.
+     */
+    void read(int16_t *output, size_t count) {
+      for (size_t i = 0; i < count; ++i) {
+        output[i] = read_pos < write_pos ? pcm[read_pos++ % pcm.size()] : 0;
+      }
+    }
+
+  private:
+    std::array<int16_t, 2 * frame_samples> pcm {};  ///< At most 40 ms queued PCM.
+    uint64_t read_pos = 0;  ///< Monotonic read cursor.
+    uint64_t write_pos = 0;  ///< Monotonic write cursor.
   };
 
   /** @brief Session-owned receiver; no platform audio work runs on the control thread. */
