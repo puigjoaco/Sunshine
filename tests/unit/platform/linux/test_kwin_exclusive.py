@@ -229,9 +229,16 @@ class ExclusiveTest(unittest.TestCase):
             state["windows"].append(dict(state["windows"][0], id="still-pending"))
             exclusive.atomic_save(path, state)
             guardian = exclusive.Guardian(path, None)
-            with patch.object(guardian, "script", return_value={"completed": ["saved-window"], "mismatches": ["still-pending"]}):
+            with patch.object(guardian, "script", return_value={"completed": ["saved-window"], "mismatches": ["still-pending"]}) as attempts, patch.object(exclusive.time, "sleep") as sleep:
                 with self.assertRaisesRegex(RuntimeError, "Window restore incomplete"):
                     guardian.restore_windows(guardian.state)
+            self.assertEqual(attempts.call_count, 3)
+            self.assertEqual(sleep.call_count, 2)
+            self.assertEqual(json.loads(path.read_text())["window_recovery"], ["saved-window"])
+            for retry in attempts.call_args_list[1:]:
+                declaration = retry.args[0].split(";\n", 1)[0]
+                self.assertNotIn('"id": "saved-window"', declaration)
+                self.assertIn('"id": "still-pending"', declaration)
             restarted = exclusive.Guardian(path, None)
             with patch.object(restarted, "script", return_value=True) as script:
                 restarted.restore_windows(restarted.state)
@@ -239,6 +246,44 @@ class ExclusiveTest(unittest.TestCase):
             self.assertNotIn('"id": "saved-window"', declaration)
             self.assertIn('"id": "still-pending"', declaration)
             self.assertCountEqual(restarted.state["window_recovery"], ["saved-window", "still-pending"])
+
+    def test_pending_window_retries_after_settling_and_finishes_recovery(self):
+        """A slow client converges without a new session or replaying completed stages."""
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.json"
+            state = recovery_state()
+            state["windows"].append(dict(state["windows"][0], id="slow-window"))
+            exclusive.atomic_save(path, state)
+            guardian = exclusive.Guardian(path, None)
+            calls = []
+
+            def script(code):
+                calls.append(code.split(";\n", 1)[0])
+                if len(calls) == 1:
+                    return {"completed": ["saved-window"], "mismatches": ["slow-window"]}
+                self.assertEqual(json.loads(path.read_text())["window_recovery"], ["saved-window"])
+                return {"completed": ["slow-window"], "mismatches": []}
+
+            with patch.object(guardian, "unload"), patch.object(exclusive, "outputs", return_value=[output()]), patch.object(exclusive, "doctor") as doctor, patch.object(guardian, "script", side_effect=script), patch.object(exclusive.time, "sleep") as sleep:
+                guardian.restore()
+            doctor.assert_called_once()
+            sleep.assert_called_once_with(0.5)
+            self.assertEqual(len(calls), 2)
+            self.assertNotIn('"id": "saved-window"', calls[1])
+            self.assertIn('"id": "slow-window"', calls[1])
+            self.assertFalse(path.exists())
+            self.assertIsNone(guardian.state)
+
+    def test_window_fast_path_never_waits_or_retries_completed_windows(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.json"
+            exclusive.atomic_save(path, recovery_state())
+            guardian = exclusive.Guardian(path, None)
+            with patch.object(guardian, "script", return_value=True) as script, patch.object(exclusive.time, "sleep") as sleep:
+                guardian.restore_windows(guardian.state)
+                guardian.restore_windows(guardian.state)
+            script.assert_called_once()
+            sleep.assert_not_called()
 
     def test_unsettled_normal_geometry_rolls_back_before_discarding_snapshot(self):
         with tempfile.TemporaryDirectory() as directory:

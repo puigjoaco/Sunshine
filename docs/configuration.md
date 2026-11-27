@@ -1074,8 +1074,12 @@ so clients see that output disappear before their final window configures.
 The guardian restores Plasma assignments, then surviving original windows in
 separate unmaximize, geometry and state phases. It verifies output, geometry and
 all saved states, finishes early after convergence, and durably records each
-completed window. An unrelated mismatch cannot cause later recovery attempts to
-undo a completed window's newer placement. Failed exact restoration enables connected original outputs at preferred
+completed window. Pending windows get up to three bounded passes with short
+settling pauses only after a mismatch. A failed teardown gets a final bounded
+recovery when Sunshine closes the guardian lifeline; persistent failures retain
+the snapshot for emergency recovery. An unrelated mismatch cannot cause later
+recovery attempts to undo a completed window's newer placement. Failed exact
+restoration enables connected original outputs at preferred
 modes and retains the snapshot for retry. A lost guardian is recovered by
 Sunshine; a lost Sunshine lifeline triggers immediate guardian recovery.
 **Service deployments must also run the helper's `restore` action in

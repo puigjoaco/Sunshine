@@ -689,11 +689,22 @@ if(!physical.length || physical.some(function(s){var g=s.geometry;return p.x>=g.
 """.replace('PRIMARY', json.dumps(min(self.state["outputs"], key=lambda o: o["priority"] or 1000)["name"])))
 
     def restore_windows(self, saved):
-        """Restore surviving originals in phases, stopping early after verified convergence."""
+        """Retry only pending originals after settling, without delaying convergence."""
+        for attempt in range(3):
+            result = self.restore_windows_attempt(saved)
+            if isinstance(result, dict) and not result.get("mismatches"):
+                return
+            if attempt < 2:
+                print(f"exclusive: pending windows retry={attempt + 1}", file=sys.stderr)
+                time.sleep(0.5)
+        raise RuntimeError("Window restore incomplete; original snapshot retained: " + json.dumps(result))
+
+    def restore_windows_attempt(self, saved):
+        """Run one bounded phased pass and durably exclude completed/user-owned windows."""
         completed = saved.get("window_recovery", [])
         rows = [w for w in saved["windows"] if w["id"] not in completed]
         if not rows:
-            return
+            return {"completed": [], "mismatches": []}
         result = self.script("var SAVED=" + json.dumps(rows) + ";\n" + """
 var tries=0, stable={}, done={}, skipped={};
 function sameRect(a,b) {
@@ -764,8 +775,7 @@ var timer=new QTimer();timer.interval=50;timer.timeout.connect(restore);timer.st
         if isinstance(result, dict):
             saved["window_recovery"] = list(dict.fromkeys(completed + result.get("completed", [])))
             atomic_save(self.path, saved)
-        if not isinstance(result, dict) or result.get("mismatches"):
-            raise RuntimeError("Window restore incomplete; original snapshot retained: " + json.dumps(result))
+        return result
 
     def restore_outputs(self, saved):
         """Apply and verify the original output layout once per recovery cycle."""
@@ -884,9 +894,9 @@ def main():
                         response = {"ok": True, "pointer": guardian.pointer}
                     except Exception as error:
                         print(f"exclusive: {error}", file=sys.stderr)
-                        # Initialization must recover immediately. A failed restore
-                        # retains progress for ExecStopPost/manual retry, without a
-                        # second full retry on the latency-sensitive teardown path.
+                        # Initialization must recover immediately. Window restore
+                        # already retries pending rows; EOF below gives a failed
+                        # teardown one final bounded recovery before exiting.
                         if request.get("action") not in ("restore", "restore-outputs"):
                             try:
                                 guardian.restore()
