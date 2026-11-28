@@ -11,6 +11,7 @@
 // local includes
 #include "input.h"
 #include "platform/common.h"
+#include "stream_resize.h"
 #include "thread_safe.h"
 #include "video_colorspace.h"
 
@@ -41,6 +42,7 @@ namespace video {
     int enableIntraRefresh;  ///< Intra refresh setting: 0 = disabled, 1 = enabled.
     int virtual_display_scale = 0;  ///< Optional per-client scale percentage; zero uses host configuration.
     bool client_stream = false;  ///< True only for real capture, never encoder capability probes.
+    std::shared_ptr<stream_resize::state_t> resize;  ///< Session-local Porta resize mailbox; probes leave it empty.
   };
 
   namespace amf {
@@ -706,6 +708,9 @@ namespace video {
     config_t config,
     void *channel_data
   );
+
+  /** @brief Whether a launch will use the owned KWin output and asynchronous encoder resize path. */
+  bool resize_supported();
 
   /**
    * @brief Validate encoder before it is used.

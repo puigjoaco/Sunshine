@@ -945,9 +945,17 @@ namespace rtsp_stream {
     // Tell the client about our supported features
     ss << "a=x-ss-general.featureFlags:" << (uint32_t) platf::get_capabilities() << std::endl;
 
-    if (camera::available()) ss << "a=x-ss-camera.version:1" << std::endl;
+    if (camera::available()) {
+      ss << "a=x-ss-camera.version:1" << std::endl;
+    }
 
-    if (microphone::available()) ss << "a=x-ss-microphone.version:1" << std::endl;
+    if (microphone::available()) {
+      ss << "a=x-ss-microphone.version:1" << std::endl;
+    }
+
+    if (video::resize_supported()) {
+      ss << "a=x-ss-resize.version:1" << std::endl;
+    }
 
     // Always request new control stream encryption if the client supports it
     uint32_t encryption_flags_supported = SS_ENC_CONTROL_V2 | SS_ENC_AUDIO;

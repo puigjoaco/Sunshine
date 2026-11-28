@@ -26,6 +26,11 @@ TEST(KwinVirtualOutputTest, EncoderProbeNeverCreatesAnOutput) {
   EXPECT_FALSE(kwin::virtual_mode(false, true, 3120, 1440, 60, 100));
 }
 
+TEST(KwinVirtualOutputTest, AcceptsThePortaResizeLowerBound) {
+  EXPECT_TRUE(kwin::virtual_mode(true, true, 256, 256, 60, 100));
+  EXPECT_FALSE(kwin::virtual_mode(true, true, 255, 256, 60, 100));
+}
+
 TEST(KwinVirtualOutputTest, KeepsPhonePixelsIndependentOfLogicalScale) {
   const auto mode = kwin::virtual_mode(true, true, 3120, 1440, 60, 150);
   ASSERT_TRUE(mode);
@@ -145,6 +150,197 @@ TEST(KwinCaptureReconnectNestedTest, RetainsRealScreencastAndNegotiatesPortraitF
   EXPECT_TRUE(owned_names().empty());
 }
 
+TEST(KwinCaptureReconnectNestedTest, ResizesCaptureAndEncoderWithoutEndingSession) {
+  const auto runtime = lizardbyte::common::get_env("XDG_RUNTIME_DIR");
+  if (lizardbyte::common::get_env("SUNSHINE_TEST_KWIN_CAPTURE_RECONNECT") != "1" || runtime.find("/sunshine-exclusive-") == std::string::npos) {
+    GTEST_SKIP() << "Requires the isolated nested-KWin test harness";
+  }
+  input::testing::set_platform_input({});
+  const auto saved = config::video;
+  const auto restore = util::fail_guard([&] {
+    config::video = saved;
+  });
+  config::video.capture = "kwin";
+  config::video.virtual_display = true;
+  config::video.virtual_display_mode = "exclusive";
+  config::video.virtual_display_scale = 100;
+  config::video.encoder = "software";
+  config::video.hevc_mode = 1;
+  config::video.av1_mode = 1;
+  const auto platform = platf::init();
+  ASSERT_TRUE(platform);
+  ASSERT_EQ(video::probe_encoders(), 0);
+  ASSERT_TRUE(video::resize_supported());
+  video::config_t client {};
+  client.width = 1280;
+  client.height = 720;
+  client.framerate = 30;
+  client.bitrate = 5000;
+  client.slicesPerFrame = 1;
+  client.numRefFrames = 1;
+  client.resize = std::make_shared<stream_resize::state_t>(client.width, client.height);
+  const auto mailbox = std::make_shared<safe::mail_raw_t>();
+  const auto shutdown = mailbox->event<bool>(mail::shutdown);
+  const auto packets = mail::man->queue<video::packet_t>(mail::video_packets);
+  while (packets->peek()) {
+    packets->pop();
+  }
+  std::jthread thread([&] {
+    video::capture(mailbox, client, nullptr);
+  });
+  const auto stop = util::fail_guard([&] {
+    kwin::exclusive_t::instance().session_stopping(false);
+    shutdown->raise(true);
+    if (thread.joinable()) {
+      thread.join();
+    }
+  });
+  auto next_frame = [&](int width, int height) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!shutdown->peek() && std::chrono::steady_clock::now() < deadline) {
+      auto packet = packets->pop(std::chrono::milliseconds(100));
+      if (!packet) {
+        continue;
+      }
+      if (!packet->is_idr()) {
+        continue;
+      }
+      const auto path = std::filesystem::path(runtime) / ("resize-idr-" + std::to_string(width) + "x" + std::to_string(height) + ".h264");
+      {
+        std::ofstream sample(path, std::ios::binary);
+        sample.write(reinterpret_cast<const char *>(packet->data()), packet->data_size());
+      }
+      namespace bp = boost::process::v1;
+      bp::ipstream output;
+      bp::child probe(bp::search_path("ffprobe"), bp::args(std::vector<std::string> {"-v", "error", "-show_entries", "frame=key_frame,width,height", "-read_intervals", "%+#1", "-of", "json", path.string()}), bp::std_out > output, bp::std_err > bp::null);
+      if (!probe.wait_for(std::chrono::seconds(2))) {
+        probe.terminate();
+        probe.wait();
+        return false;
+      }
+      const auto decoded = nlohmann::json::parse(output, nullptr, false);
+      if (probe.exit_code() == 0 && decoded.is_object() && decoded.contains("frames") && !decoded["frames"].empty()) {
+        const auto &first = decoded["frames"][0];
+        if (first.value("width", 0) == width && first.value("height", 0) == height && first.value("key_frame", 0) == 1) {
+          return true;
+        }
+      }
+    }
+    return false;
+  };
+  ASSERT_TRUE(next_frame(1280, 720));
+  auto owned = [] {
+    auto names = platf::kwin_display_names();
+    std::erase_if(names, [](const auto &name) {
+      return !name.starts_with("Virtual-Sunshine-");
+    });
+    return names;
+  };
+  const auto names = owned();
+  ASSERT_EQ(names.size(), 1);
+  std::ofstream evidence(std::filesystem::path(runtime).parent_path() / "in-session-resize.log");
+  for (const auto request : {stream_resize::request_t {1, 720, 1280}, {3, 1280, 720}, {4, 1440, 3120}}) {
+    const auto started = std::chrono::steady_clock::now();
+    if (request.sequence == 3) {
+      client.resize->offer({2, 640, 480});
+    }
+    client.resize->offer(request);
+    std::optional<stream_resize::result_t> result;
+    while (!shutdown->peek() && std::chrono::steady_clock::now() - started < std::chrono::seconds(4)) {
+      result = client.resize->take_result();
+      if (result && result->mode.sequence == request.sequence) {
+        break;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    ASSERT_TRUE(result) << "Resize result timed out";
+    ASSERT_EQ(result->mode.sequence, request.sequence);
+    ASSERT_FALSE(result->failed);
+    EXPECT_EQ(result->mode.width, request.width);
+    EXPECT_EQ(result->mode.height, request.height);
+    ASSERT_TRUE(next_frame(request.width, request.height));
+    EXPECT_FALSE(shutdown->peek());
+    EXPECT_EQ(owned(), names);
+    const auto port = mailbox->event<input::touch_port_t>(mail::touch_port)->pop(std::chrono::milliseconds(100));
+    ASSERT_TRUE(port);
+    EXPECT_EQ(port->width, request.width);
+    EXPECT_EQ(port->height, request.height);
+    evidence << "IN_SESSION_RESIZE sequence=" << request.sequence << " size=" << request.width << 'x' << request.height
+             << " IDR=1 elapsed_ms=" << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started).count() << std::endl;
+  }
+  // Fail the first KScreen readback only after the requested mode actually
+  // changed. The shim, output and sentinel all live in this private session.
+  const auto original_path = lizardbyte::common::get_env("PATH");
+  const auto real_doctor = boost::process::v1::search_path("kscreen-doctor").string();
+  const auto shim_dir = std::filesystem::path(runtime) / "resize-shim";
+  std::filesystem::create_directories(shim_dir);
+  const auto shim = shim_dir / "kscreen-doctor";
+  const auto sentinel = shim_dir / "fail-once";
+  {
+    std::ofstream script(shim);
+    script << "#!/usr/bin/python3\nimport json, subprocess, sys\nfrom pathlib import Path\nreal=" << nlohmann::json(real_doctor).dump() << R"(
+result=subprocess.run([real, *sys.argv[1:]], capture_output=True)
+flag=Path(__file__).with_name('fail-once')
+if result.returncode == 0 and sys.argv[1:] == ['-j'] and flag.exists():
+    for output in json.loads(result.stdout)['outputs']:
+        if not output['name'].startswith('Virtual-Sunshine-'): continue
+        mode=next(m for m in output['modes'] if m['id'] == output['currentModeId'])
+        if mode['size'] == {'width':1024, 'height':768}:
+            flag.unlink()
+            sys.exit(1)
+sys.stdout.buffer.write(result.stdout)
+sys.stderr.buffer.write(result.stderr)
+sys.exit(result.returncode)
+)";
+    std::ofstream arm(sentinel);
+  }
+  std::filesystem::permissions(shim, std::filesystem::perms::owner_all);
+  const auto restore_path = util::fail_guard([&] {
+    setenv("PATH", original_path.c_str(), 1);
+  });
+  ASSERT_EQ(setenv("PATH", (shim_dir.string() + ":" + original_path).c_str(), 1), 0);
+  const auto failure_started = std::chrono::steady_clock::now();
+  client.resize->offer({5, 1024, 768});
+  std::optional<stream_resize::result_t> rolled_back;
+  while (std::chrono::steady_clock::now() - failure_started < std::chrono::seconds(4)) {
+    rolled_back = client.resize->take_result();
+    if (rolled_back) {
+      break;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  ASSERT_FALSE(std::filesystem::exists(sentinel)) << "Failure injection never reached the changed mode";
+  ASSERT_TRUE(rolled_back);
+  EXPECT_TRUE(rolled_back->failed);
+  EXPECT_EQ(rolled_back->mode.sequence, 5);
+  EXPECT_EQ(rolled_back->mode.width, 1440);
+  EXPECT_EQ(rolled_back->mode.height, 3120);
+  ASSERT_TRUE(next_frame(1440, 3120));
+  EXPECT_EQ(owned(), names);
+  EXPECT_FALSE(shutdown->peek());
+  evidence << "IN_SESSION_ROLLBACK status=1 size=1440x3120 IDR=1 elapsed_ms="
+           << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - failure_started).count() << std::endl;
+  client.resize->offer({6, 257, 1280});
+  const auto rejected = client.resize->take_result();
+  ASSERT_TRUE(rejected);
+  EXPECT_TRUE(rejected->failed);
+  EXPECT_EQ(rejected->mode.width, 1440);
+  EXPECT_EQ(rejected->mode.height, 3120);
+
+  client.resize->offer({7, 720, 1280});
+  const auto waiting = std::chrono::steady_clock::now();
+  while (client.resize->needs_capture() && std::chrono::steady_clock::now() - waiting < std::chrono::seconds(1)) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  const auto stopping = std::chrono::steady_clock::now();
+  kwin::exclusive_t::instance().session_stopping(false);
+  shutdown->raise(true);
+  thread.join();
+  const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - stopping);
+  EXPECT_LT(elapsed, std::chrono::seconds(10));
+  evidence << "IN_SESSION_DISCONNECT_DURING_RESIZE elapsed_ms=" << elapsed.count() << std::endl;
+}
+
 TEST(KwinExclusiveNestedTest, ReconnectKeepsOutputAndFinalDisconnectExpires) {
   const auto name = lizardbyte::common::get_env("SUNSHINE_TEST_KWIN_EXCLUSIVE_OUTPUT");
   const auto runtime = lizardbyte::common::get_env("XDG_RUNTIME_DIR");
@@ -198,7 +394,9 @@ TEST(KwinExclusiveNestedTest, RecoversSavedDeskWhenGuardianIsKilled) {
 TEST(KwinExclusiveNestedTest, NormalSessionEndBypassesReconnectGrace) {
   const auto name = lizardbyte::common::get_env("SUNSHINE_TEST_KWIN_EXCLUSIVE_OUTPUT");
   const auto runtime = lizardbyte::common::get_env("XDG_RUNTIME_DIR");
-  if (name.empty() || runtime.find("/sunshine-exclusive-") == std::string::npos) GTEST_SKIP();
+  if (name.empty() || runtime.find("/sunshine-exclusive-") == std::string::npos) {
+    GTEST_SKIP();
+  }
   auto output = std::make_shared<int>(42);
   std::weak_ptr<int> lifetime = output;
   auto &lease = kwin::exclusive_t::instance();
@@ -217,7 +415,9 @@ TEST(KwinExclusiveNestedTest, NormalSessionEndBypassesReconnectGrace) {
 TEST(KwinExclusiveNestedTest, RotationSessionEndPreservesReconnectGrace) {
   const auto name = lizardbyte::common::get_env("SUNSHINE_TEST_KWIN_EXCLUSIVE_OUTPUT");
   const auto runtime = lizardbyte::common::get_env("XDG_RUNTIME_DIR");
-  if (name.empty() || runtime.find("/sunshine-exclusive-") == std::string::npos) GTEST_SKIP();
+  if (name.empty() || runtime.find("/sunshine-exclusive-") == std::string::npos) {
+    GTEST_SKIP();
+  }
   auto output = std::make_shared<int>(42);
   std::weak_ptr<int> lifetime = output;
   auto &lease = kwin::exclusive_t::instance();

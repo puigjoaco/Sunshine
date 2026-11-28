@@ -167,7 +167,9 @@ namespace kwin {
         }
       }
 
-      if (upgraded && !create_file) std::this_thread::sleep_for(std::chrono::milliseconds(3000));
+      if (upgraded && !create_file) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(3000));
+      }
       initialized = true;
     }
 
@@ -534,7 +536,7 @@ namespace kwin {
      * @param config Replacement stream's physical mode and scale.
      * @return Zero after KScreen mode readback; minus one on unsupported modes.
      */
-    int configure_virtual(const video::config_t &config) {
+    int configure_virtual(const video::config_t &config, std::chrono::steady_clock::time_point deadline = std::chrono::steady_clock::time_point::max()) {
       const auto fps = video::framerate_to_rational(config);
       const auto mode = virtual_mode(config::video.virtual_display, config.client_stream, config.width, config.height, av_q2d(fps), client_display::select_scale(config.virtual_display_scale, config::video.virtual_display_scale));
       if (!mode || !out_params) {
@@ -543,7 +545,7 @@ namespace kwin {
       const auto output_name = out_params->name;
       const auto scale = mode->scale;
 
-      auto outputs_json = run_kscreen({"-j"});
+      auto outputs_json = run_kscreen({"-j"}, deadline);
       auto find_output = [&](const nlohmann::json &state) -> nlohmann::json {
         for (const auto &output : state.value("outputs", nlohmann::json::array())) {
           if (output.value("name", "") == output_name) {
@@ -568,15 +570,15 @@ namespace kwin {
       };
       auto mode_id = find_mode();
       if (mode_id.empty()) {
-        run_kscreen({std::format("output.{}.addCustomMode.{}.{}.{}.reduced", output_name, config.width, config.height, refresh_mhz)});
-        output = find_output(run_kscreen({"-j"}));
+        run_kscreen({std::format("output.{}.addCustomMode.{}.{}.{}.reduced", output_name, config.width, config.height, refresh_mhz)}, deadline);
+        output = find_output(run_kscreen({"-j"}, deadline));
         if (output.empty() || (mode_id = find_mode()).empty()) {
           BOOST_LOG(error) << "[kwingrab] Requested virtual refresh rate unavailable";
           return -1;
         }
       }
-      run_kscreen({std::format("output.{}.mode.{}", output_name, mode_id), std::format("output.{}.scale.{}", output_name, scale)});
-      output = find_output(run_kscreen({"-j"}));
+      run_kscreen({std::format("output.{}.mode.{}", output_name, mode_id), std::format("output.{}.scale.{}", output_name, scale)}, deadline);
+      output = find_output(run_kscreen({"-j"}, deadline));
       if (output.empty() || output.value("currentModeId", "") != mode_id || !output.value("enabled", false) || std::abs(output.value("scale", 0.0) - scale) > 0.001) {
         BOOST_LOG(error) << "[kwingrab] Virtual output mode/scale verification failed";
         return -1;
@@ -612,7 +614,7 @@ namespace kwin {
      * @param args Argument vector; commands address only our virtual output.
      * @return Parsed state for -j, or an empty object for commands or failure.
      */
-    static nlohmann::json run_kscreen(const std::vector<std::string> &args) {
+    static nlohmann::json run_kscreen(const std::vector<std::string> &args, std::chrono::steady_clock::time_point deadline = std::chrono::steady_clock::time_point::max()) {
       namespace bp = boost::process::v1;
       try {
         std::unique_ptr<FILE, decltype(&fclose)> output(tmpfile(), fclose);
@@ -624,8 +626,12 @@ namespace kwin {
           BOOST_LOG(error) << "[kwingrab] Virtual outputs require kscreen-doctor";
           return {};
         }
+        auto remaining = std::min(5000ms, std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now()));
+        if (remaining <= 0ms) {
+          return {};
+        }
         bp::child child(command, bp::args(args), bp::std_in<bp::null, bp::std_out> output.get(), bp::std_err > bp::null, bp::limit_handles);
-        if (!child.wait_for(5s)) {
+        if (!child.wait_for(remaining)) {
           child.terminate();
           child.wait();
           BOOST_LOG(error) << "[kwingrab] kscreen-doctor timed out";
@@ -851,9 +857,11 @@ namespace kwin {
     /**
      * @brief Retain the actual client configuration for virtual output creation.
      * @param config Client configuration; probes leave client_stream false.
+     * @param type Capture/encoder memory type.
      */
-    explicit kwin_t(const video::config_t &config):
+    explicit kwin_t(const video::config_t &config, platf::mem_type_e type):
         pipewire_display_t {},
+        capture_type(type),
         client_config(config) {}
 
     /** @brief Retain a successfully initialized exclusive output for reconnects. */
@@ -866,40 +874,47 @@ namespace kwin {
     int configure_stream(const std::string &display_name, int &out_pipewire_fd, uint32_t &out_pipewire_node, uint64_t &out_pipewire_objectserial) override {
       const bool virtual_output = config::video.virtual_display && client_config.client_stream;
       const bool want_exclusive = virtual_output && config::video.virtual_display_mode == "exclusive";
-      if (want_exclusive) {
-        screencast = std::static_pointer_cast<screencast_t>(exclusive_t::instance().resume());
-        exclusive = screencast != nullptr;
-      }
-      const bool resumed = exclusive;
-      if (!screencast) {
-        screencast = std::make_shared<screencast_t>();
-        if (screencast->init(true) < 0) {
+      if (replacement) {
+        if (screencast->configure_virtual(client_config, std::chrono::steady_clock::now() + 800ms) < 0 ||
+            (replacement_exclusive && !exclusive_t::instance().resize(screencast.get(), screencast->out_params->name))) {
           return -1;
         }
+      } else {
         if (want_exclusive) {
-          if (!exclusive_t::instance().prepare(screencast.get())) {
+          screencast = std::static_pointer_cast<screencast_t>(exclusive_t::instance().resume());
+          exclusive = screencast != nullptr;
+        }
+        const bool resumed = exclusive;
+        if (!screencast) {
+          screencast = std::make_shared<screencast_t>();
+          if (screencast->init(true) < 0) {
             return -1;
           }
-          exclusive = true;
+          if (want_exclusive) {
+            if (!exclusive_t::instance().prepare(screencast.get())) {
+              return -1;
+            }
+            exclusive = true;
+          }
         }
-      }
-      try {
-        if ((resumed ? screencast->configure_virtual(client_config) : virtual_output ? screencast->start_virtual(client_config) :
-                                                                                       screencast->start(display_name)) < 0) {
+        try {
+          if ((resumed ? screencast->configure_virtual(client_config) : virtual_output ? screencast->start_virtual(client_config) :
+                                                                                         screencast->start(display_name)) < 0) {
+            return -1;
+          }
+          if (want_exclusive) {
+            if (!exclusive_t::instance().begin(screencast.get(), screencast->out_params->name)) {
+              return -1;
+            }
+            exclusive = true;
+            // Exclusive makes the sole output the origin of the desktop.
+            screencast->out_params->pos_x = 0;
+            screencast->out_params->pos_y = 0;
+          }
+        } catch (const std::exception &exception) {
+          BOOST_LOG(error) << "[kwingrab] Virtual output configuration: " << exception.what();
           return -1;
         }
-        if (want_exclusive) {
-          if (!exclusive_t::instance().begin(screencast.get(), screencast->out_params->name)) {
-            return -1;
-          }
-          exclusive = true;
-          // Exclusive makes the sole output the origin of the desktop.
-          screencast->out_params->pos_x = 0;
-          screencast->out_params->pos_y = 0;
-        }
-      } catch (const std::exception &exception) {
-        BOOST_LOG(error) << "[kwingrab] Virtual output configuration: " << exception.what();
-        return -1;
       }
       if (screencast->out_params) {
         // Return values for pipewire init
@@ -918,6 +933,42 @@ namespace kwin {
       return -1;
     }
 
+    /** @brief Only protocol-created Sunshine outputs support Porta resize. */
+    bool owns_virtual_output() const override {
+      return ready && client_config.client_stream && screencast && screencast->out_params && screencast->out_params->name.starts_with("Virtual-Sunshine-");
+    }
+
+    /** @brief Reconnect the PipeWire consumer to the same live screencast node. */
+    std::shared_ptr<platf::display_t> resize(const video::config_t &config) override {
+      if (!owns_virtual_output()) {
+        return nullptr;
+      }
+      try {
+        auto next = std::make_shared<kwin_t>(config, capture_type);
+        next->screencast = screencast;
+        next->replacement = true;
+        next->replacement_exclusive = exclusive;
+        if (next->init(capture_type, "", config)) {
+          return nullptr;
+        }
+        // init() tolerates a negotiation timeout; a resize must not confirm a size PipeWire never delivered.
+        if (!next->shared_state || next->shared_state->negotiated_width.load() <= 0 || next->shared_state->negotiated_height.load() <= 0 ||
+            next->width != config.width || next->height != config.height) {
+          BOOST_LOG(error) << "[resize] PipeWire did not negotiate "sv << config.width << 'x' << config.height;
+          return nullptr;
+        }
+        next->ready = true;
+        next->exclusive = std::exchange(exclusive, false);
+        return next;
+      } catch (const std::exception &exception) {
+        BOOST_LOG(error) << "[resize] KWin consumer rebuild failed: " << exception.what();
+        return nullptr;
+      }
+    }
+
+    bool replacement = false;  ///< A resize borrows the existing protocol owner, without prepare/enter.
+    bool replacement_exclusive = false;  ///< Whether the existing owner's guardian needs a layout refresh.
+    platf::mem_type_e capture_type;  ///< Memory type retained for in-session consumer rebuilds.
     video::config_t client_config;  ///< Configuration of the capture owner.
     std::shared_ptr<screencast_t> screencast;  ///< Screencast, optionally retained across reconnects.
     bool exclusive = false;  ///< The guardian owns an exclusive snapshot for this capture.
@@ -941,7 +992,7 @@ namespace platf {
       return nullptr;
     }
 
-    auto display = std::make_shared<kwin::kwin_t>(config);
+    auto display = std::make_shared<kwin::kwin_t>(config, hwdevice_type);
     if (display->init(hwdevice_type, display_name, config)) {
       return nullptr;
     }

@@ -1596,6 +1596,9 @@ namespace video {
       return;
     }
     display_wp = disp;
+    if (capture_ctxs.front().config.resize) {
+      capture_ctxs.front().config.resize->enable(disp->owns_virtual_output());
+    }
 
     constexpr auto capture_buffer_size = 12;
     std::list<std::shared_ptr<platf::img_t>> imgs(capture_buffer_size);
@@ -1700,6 +1703,7 @@ namespace video {
 
     while (capture_ctx_queue->running()) {
       bool artificial_reinit = false;
+      bool resize_reinit = false;
 
       auto push_captured_image_callback = [&](std::shared_ptr<platf::img_t> &&img, bool frame_captured) -> bool {
         KITTY_WHILE_LOOP(auto capture_ctx = std::begin(capture_ctxs), capture_ctx != std::end(capture_ctxs), {
@@ -1724,6 +1728,19 @@ namespace video {
           capture_ctxs.emplace_back(std::move(*capture_ctx_queue->pop()));
         }
 
+        if (capture_ctxs.size() > 1) {
+          for (auto &ctx : capture_ctxs) {
+            if (ctx.config.resize) {
+              ctx.config.resize->enable(false);
+            }
+          }
+        }
+
+        if (capture_ctxs.size() == 1 && capture_ctxs.front().config.resize && capture_ctxs.front().config.resize->needs_capture()) {
+          artificial_reinit = true;
+          resize_reinit = true;
+          return false;
+        }
         if (switch_display_event->peek()) {
           artificial_reinit = true;
           return false;
@@ -1753,7 +1770,7 @@ namespace video {
             // display_wp is modified in this thread only
             // Wait for the other shared_ptr's of display to be destroyed.
             // New displays will only be created in this thread.
-            while (display_wp->use_count() != 1) {
+            while (capture_ctx_queue->running() && display_wp->use_count() != 1) {
               // Free images that weren't consumed by the encoders. These can reference the display and prevent
               // the ref count from reaching 1. We do this here rather than on the encoder thread to avoid race
               // conditions where the encoding loop might free a good frame after reinitializing if we capture
@@ -1771,6 +1788,49 @@ namespace video {
               });
 
               std::this_thread::sleep_for(20ms);
+            }
+
+            if (capture_ctxs.empty() || !capture_ctx_queue->running()) {
+              return;
+            }
+
+            if (resize_reinit || disp->owns_virtual_output()) {
+              // The owned virtual output is this session's only display, so a
+              // display switch cannot apply; consume it instead of reinitializing forever.
+              if (switch_display_event->peek()) {
+                switch_display_event->pop();
+              }
+              auto &ctx = capture_ctxs.front();
+              auto transaction = ctx.config.resize;
+              const auto started = std::chrono::steady_clock::now();
+              while (capture_ctx_queue->running() && ctx.images->running()) {
+                auto request = transaction ? transaction->begin() : std::nullopt;
+                auto resized_config = ctx.config;
+                if (request) {
+                  resized_config.width = request->width;
+                  resized_config.height = request->height;
+                }
+                auto replacement = disp->resize(resized_config);
+                if (replacement) {
+                  disp = std::move(replacement);
+                  ctx.config = resized_config;
+                  if (request) {
+                    transaction->captured(*request);
+                  }
+                  break;
+                }
+                // Keep the protocol owner alive and return to the last encoder-
+                // confirmed mode. The session stays alive even if recovery must
+                // retry until a disconnect; every individual operation is bounded.
+                if (transaction) {
+                  transaction->failed();
+                }
+                std::this_thread::sleep_for(20ms);
+              }
+              BOOST_LOG(info) << "[resize] Capture transaction took " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started).count() << " ms";
+              display_wp = disp;
+              reinit_event.reset();
+              continue;
             }
 
             while (capture_ctx_queue->running()) {
@@ -2408,6 +2468,12 @@ namespace video {
     const encoder_t &encoder,
     void *channel_data
   ) {
+    auto resize_failure = util::fail_guard([&] {
+      if (config.resize) {
+        config.resize->failed();
+      }
+    });
+    const auto encoder_started = std::chrono::steady_clock::now();
     auto session = make_encode_session(disp.get(), encoder, config, disp->width, disp->height, std::move(encode_device));
     if (!session) {
       return;
@@ -2450,6 +2516,12 @@ namespace video {
         return;
       }
     }
+
+    // A rebuilt encoder starts with an IDR, including after rollback. Confirm
+    // the transaction only after the first encode succeeds, so first-frame
+    // conversion/encoding failures still return to the previous working mode.
+    idr_events->raise(true);
+    bool first_encoded = false;
 
     while (true) {
       bool requested_idr_frame = false;
@@ -2501,6 +2573,14 @@ namespace video {
       if (encode(frame_nr++, *session, packets, channel_data, frame_timestamp)) {
         BOOST_LOG(error) << "Could not encode video packet"sv;
         return;
+      }
+
+      if (!first_encoded) {
+        if (config.resize && config.resize->encoded()) {
+          BOOST_LOG(info) << "[resize] Encoder ready " << config.width << 'x' << config.height << " in " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - encoder_started).count() << " ms";
+        }
+        resize_failure.disable();
+        first_encoded = true;
       }
 
       session->request_normal_frame();
@@ -2922,9 +3002,20 @@ namespace video {
       }
 
       auto &encoder = *chosen_encoder;
+      if (config.resize && display->owns_virtual_output()) {
+        const auto dimensions = config.resize->dimensions();
+        config.width = dimensions.width;
+        config.height = dimensions.height;
+      }
 
       auto encode_device = make_encode_device(*display, encoder, config);
       if (!encode_device) {
+        if (config.resize && display->owns_virtual_output()) {
+          config.resize->failed();
+          display.reset();
+          std::this_thread::sleep_for(20ms);
+          continue;
+        }
         return;
       }
 
@@ -2954,6 +3045,17 @@ namespace video {
         channel_data
       );
     }
+  }
+
+  /** @brief Advertise only the owned KWin asynchronous resize capture path. */
+  bool resize_supported() {
+#ifdef SUNSHINE_BUILD_KWIN
+    // No compositor probe here: DESCRIBE must not block. Requests on a session
+    // that did not get an owned KWin output are rejected and the client reconnects.
+    return config::video.virtual_display && chosen_encoder && (chosen_encoder->flags & PARALLEL_ENCODING);
+#else
+    return false;
+#endif
   }
 
   /**

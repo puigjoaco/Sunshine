@@ -43,7 +43,7 @@ namespace kwin {
     disconnect();
   }
 
-  bool exclusive_t::request(const std::string &command) {
+  bool exclusive_t::request(const std::string &command, std::chrono::milliseconds timeout) {
     if (channel < 0) {
       int sockets[2];
       if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sockets) < 0) {
@@ -70,8 +70,10 @@ namespace kwin {
       channel = sockets[0];
       guardian = pid;
     }
-    const auto end = std::chrono::steady_clock::now() + 40s;
-    auto message = command + "\n";
+    const auto end = std::chrono::steady_clock::now() + timeout;
+    auto envelope = nlohmann::json::parse(command);
+    envelope["request_id"] = ++request_id;
+    auto message = envelope.dump() + "\n";
     size_t offset = 0;
     while (offset < message.size()) {
       auto sent = send(channel, message.data() + offset, message.size() - offset, MSG_NOSIGNAL | MSG_DONTWAIT);
@@ -84,7 +86,7 @@ namespace kwin {
         return false;
       }
     }
-    std::string reply;
+    auto &reply = response_buffer;
     while (std::chrono::steady_clock::now() < end) {
       pollfd fd {channel, POLLIN, 0};
       if (poll(&fd, 1, 100) <= 0) {
@@ -95,7 +97,11 @@ namespace kwin {
         return false;
       }
       if (byte == '\n') {
-        auto response = nlohmann::json::parse(reply, nullptr, false);
+        auto response = nlohmann::json::parse(std::exchange(reply, {}), nullptr, false);
+        if (response.is_object() && response.value("request_id", uint64_t(0)) != request_id) {
+          reply.clear();
+          continue;
+        }
         cursor.reset();
         if (response.is_object() && response.contains("pointer") && response["pointer"].is_object()) {
           const auto &p = response["pointer"];
@@ -114,7 +120,16 @@ namespace kwin {
     return false;
   }
 
+  bool exclusive_t::resize(const void *identity, const std::string &name) {
+    std::lock_guard lock(mutex);
+    if (active != identity || stopping || immediate_restore || channel < 0) {
+      return false;
+    }
+    return request(nlohmann::json {{"action", "resize"}, {"output", name}}.dump(), 1200ms);
+  }
+
   void exclusive_t::disconnect() {
+    response_buffer.clear();
     if (channel >= 0) {
       close(channel);  // EOF asks the guardian to restore even after a timeout.
       channel = -1;

@@ -1139,6 +1139,20 @@ namespace stream {
     return 0;
   }
 
+  /** @brief Send a v1 resize result reliably from the sole control-encryption thread. */
+  void send_resize_result(session_t *session, const stream_resize::result_t &result) {
+    const auto body = result.payload();
+    std::string plaintext(4, '\0');
+    plaintext[0] = char(stream_resize::result_type);
+    plaintext[1] = char(stream_resize::result_type >> 8);
+    plaintext[2] = char(body.size());
+    plaintext.append(body.data(), body.size());
+    std::array<uint8_t, 64> encrypted {};
+    auto payload = encode_control(session, plaintext, encrypted);
+    session->broadcast_ref->control_server.send(payload, session->control.peer);
+    BOOST_LOG(info) << "[resize] Result sequence=" << result.mode.sequence << " status=" << result.failed << " size=" << result.mode.width << 'x' << result.mode.height;
+  }
+
   /**
    * @brief Send the selected HDR mode to the connected client over the control channel.
    *
@@ -1252,6 +1266,15 @@ namespace stream {
       }
 
       input::passthrough(session->input, std::move(plaintext));
+    });
+
+    server->map(stream_resize::request_type, [](session_t *session, const std::string_view &payload) {
+      if (session->config.controlProtocolType != 13 || !(session->config.encryptionFlagsEnabled & SS_ENC_CONTROL_V2)) {
+        return;
+      }
+      if (auto request = stream_resize::parse(payload)) {
+        session->config.monitor.resize->offer(*request);
+      }
     });
 
     server->map(camera::packet_type, [](session_t *session, const std::string_view &payload) {
@@ -1436,6 +1459,10 @@ namespace stream {
               auto feedback_msg = feedback_queue->pop();
 
               send_feedback_msg(session, *feedback_msg);
+            }
+
+            if (auto result = session->config.monitor.resize->take_result()) {
+              send_resize_result(session, *result);
             }
 
             auto &hdr_queue = session->control.hdr_queue;
@@ -2431,6 +2458,7 @@ namespace stream {
       session->input_session_id = launch_session.client_cert.empty() ? launch_session.unique_id : launch_session.client_cert;
 
       session->config = config;
+      session->config.monitor.resize = std::make_shared<stream_resize::state_t>(config.monitor.width, config.monitor.height);
 
       session->control.connect_data = launch_session.control_connect_data;
       session->control.feedback_queue = mail->queue<platf::gamepad_feedback_msg_t>(mail::gamepad_feedback);

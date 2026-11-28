@@ -1131,6 +1131,25 @@ restoration. The snapshot is retained if visible window restoration does not
 verify. KWin/PipeWire absence before desktop login leaves the KMS greeter path
 unchanged; recovery without a snapshot is a no-op and needs no Plasma session.
 
+Porta clients supporting in-session resize v1 can rotate without reconnecting
+when Sunshine uses an owned KWin virtual output and an asynchronous encoder.
+Sunshine advertises `a=x-ss-resize.version:1` for this capture path. Requests
+require encrypted control protocol 13 with `SS_ENC_CONTROL_V2`; stock clients
+continue to use their launch mode. The newest pending request wins. Dimensions
+must be even and between 256 and 4096 pixels on each axis, and the selected
+encoder must accept the replacement mode. Framerate, bitrate, codec and HDR
+remain those negotiated at launch.
+
+Sunshine changes the mode on the same protocol-owned output, refreshes the
+exclusive guardian's layout without replacing its original desktop snapshot,
+rebuilds capture and encoding, updates absolute input bounds, and requests an
+IDR. A successful result is emitted only once the replacement encoder and its
+input conversion are initialized and its first encode succeeds. Failures roll back to the last confirmed
+stream size before returning failure. The control thread and reverse microphone
+and camera receivers remain active throughout. `[resize]` logs report capture
+transaction timing and the result's sequence and dimensions. Clients retain the
+existing rotation reconnect fallback for rejection or a four-second timeout.
+
 ### virtual_display_restore_delay
 
 Linux/KWin exclusive mode only. Integer seconds from `0` to `60`; default `5`.

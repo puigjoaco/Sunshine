@@ -259,6 +259,7 @@ class Guardian:
         self.path, self.reporter = path, reporter
         self.pointer = None
         self.recovery_deadline = None
+        self.active_output = None
         try:
             self.state = json.loads(path.read_text()) if path.exists() else None
             if self.state is not None and (self.state.get("version", 1) not in (1, 2, 3) or not isinstance(self.state.get("outputs"), list) or not isinstance(self.state.get("windows"), list)):
@@ -396,11 +397,19 @@ var timer=new QTimer();timer.interval=50;timer.timeout.connect(rollback);timer.s
         if result is not True:
             raise RuntimeError("Window snapshot rollback incomplete; original snapshot retained")
 
-    def enter(self, name):
+    def resize(self, name):
+        """Refit routing/layout under a short budget, retaining every saved rectangle."""
+        if self.state is None or self.active_output != name:
+            raise RuntimeError("Resize does not own the active output")
+        with operation_budget(time.monotonic() + 1):
+            self.enter(name, resizing=True)
+
+    def enter(self, name, resizing=False):
         """Make virtual primary; mirror it while every physical connector stays on."""
         live = outputs()
         target = next(o for o in live if o["name"] == name and o["enabled"] and owned(o))
-        self.prepare()
+        if not resizing:
+            self.prepare()
         # Acknowledged before changing output policy. Keep routing new windows too.
         result = self.script("var TARGET=" + json.dumps(name) + ";\n" + """
 var pending={}, stable={}, attempts={};
@@ -473,12 +482,14 @@ move(); report(true);
             doctor(positions)
             self.state["policy"] = "move"
             atomic_save(self.path, self.state)
-        self.move_plasma(name, touch_panel_height(target["scale"]))
+        if not resizing:
+            self.move_plasma(name, touch_panel_height(target["scale"]))
         actual = outputs()
         target = next(o for o in actual if o["name"] == name)
         if not target["enabled"] or target["priority"] != 1 or target["pos"] != {"x": 0, "y": 0} or any(not o["enabled"] for o in actual if o["name"] in {s["name"] for s in originals}):
             raise RuntimeError("KWin rejected primary/always-enabled policy; restoring originals")
         print("exclusive: policy=" + self.state["policy"] + "; physical connectors remain enabled", file=sys.stderr)
+        self.active_output = name
 
     def move_plasma(self, target, height=None):
         """Move containments, enlarging only snapshotted panels on a virtual output."""
@@ -960,6 +971,8 @@ def main():
                             guardian.prepare()
                         elif request["action"] == "enter":
                             guardian.enter(request["output"])
+                        elif request["action"] == "resize":
+                            guardian.resize(request["output"])
                         elif request["action"] == "restore-outputs":
                             guardian.restore(finish=False)
                         elif request["action"] == "restore":
@@ -971,12 +984,13 @@ def main():
                         print(f"exclusive: {error}", file=sys.stderr)
                         # Initialization recovers immediately. EOF shares the
                         # same deadline and never retries abandoned windows.
-                        if request.get("action") not in ("restore", "restore-outputs"):
+                        if request.get("action") not in ("restore", "restore-outputs", "resize"):
                             try:
                                 guardian.restore()
                             except Exception as restore_error:
                                 print(f"exclusive restore: {restore_error}", file=sys.stderr)
                         response = {"ok": False, "pointer": guardian.pointer}
+                    response["request_id"] = request.get("request_id", 0)
                     print(json.dumps(response), flush=True)
         except Exception as error:
             print(f"exclusive guardian: {error}", file=sys.stderr)

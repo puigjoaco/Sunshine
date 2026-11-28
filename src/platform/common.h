@@ -713,6 +713,20 @@ namespace platf {
      */
     virtual capture_e capture(const push_captured_image_cb_t &push_captured_image_cb, const pull_free_image_cb_t &pull_free_image_cb, bool *cursor) = 0;
 
+    /** @brief Whether this capture owns an output whose mode can change in-session. */
+    virtual bool owns_virtual_output() const {
+      return false;
+    }
+
+    /**
+     * @brief Negotiate a replacement capture while retaining the same owned output.
+     * @param config Requested stream mode; the caller retains this display for rollback.
+     * @return Replacement capture, or null without releasing the output owner.
+     */
+    virtual std::shared_ptr<display_t> resize(const video::config_t &config) {
+      return nullptr;
+    }
+
     /**
      * @brief Allocate an image buffer compatible with this display backend.
      *

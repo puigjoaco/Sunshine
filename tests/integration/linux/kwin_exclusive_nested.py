@@ -65,7 +65,7 @@ def outer():
             if artifacts:
                 destination = Path(artifacts)
                 destination.mkdir(parents=True, exist_ok=True)
-                for source in Path(directory).glob("*.log"):
+                for source in list(Path(directory).glob("*.log")) + list((Path(directory) / "runtime").glob("resize-idr-*.h264")):
                     shutil.copy2(source, destination / source.name)
 
 
@@ -88,6 +88,7 @@ def inner():
         process = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=log, stderr=log, text=True, start_new_session=True)
         groups.add(process.pid)
         children.append(process)
+        print(f"NESTED_PROCESS name={name} pid={process.pid}", flush=True)
         return process
 
     spec = importlib.util.spec_from_file_location("exclusive", HELPER)
@@ -105,6 +106,7 @@ def inner():
         logs.append(log)
         p = subprocess.Popen([sys.executable, str(HELPER), "watch"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=log, text=True)
         children.append(p)
+        print(f"NESTED_PROCESS name=guardian pid={p.pid}", flush=True)
         return p
 
     def plasma():
@@ -278,7 +280,11 @@ workspace.stackingOrder.filter(function(w) { return w.caption.indexOf('exclusive
         portrait_mode = next(m["id"] for m in target["modes"] if m["size"] == {"width": 1440, "height": 3120})
         run("kscreen-doctor", f"output.{target['id']}.mode.{portrait_mode}")
         assert mirrors("Virtual-Sunshine-test-1")
-        command(p, {"action": "enter", "output": "Virtual-Sunshine-test-1"})
+        command(p, {"action": "resize", "output": "Virtual-Sunshine-test-1"})
+        resized = stateful_rectangles("resized-stateful")
+        for bounds in resized.values():
+            assert bounds["x"] >= 0 and bounds["y"] >= 0 and bounds["x"] + bounds["width"] <= 577 and bounds["y"] + bounds["height"] <= 1249, resized
+        print("PASS: maximized/fullscreen windows refit the resized virtual viewport", flush=True)
         assert snapshot.read_text() == snapshot_before, "reconnect overwrote original snapshot"
         assert plasma()["heights"] == [70] * len(plasma_before["heights"]), plasma()
         assert mirrors("Virtual-Sunshine-test-1")
@@ -451,9 +457,14 @@ workspace.stackingOrder.filter(function(w) { return w.caption.indexOf('exclusive
                          for o in json.loads(run("pw-dump"))), "private PipeWire policy manager")
         env["SUNSHINE_TEST_KWIN_CAPTURE_RECONNECT"] = "1"
         result = subprocess.run([str(BUILD / "tests/test_sunshine"),
-                                 "--gtest_filter=KwinCaptureReconnectNestedTest.*"],
-                                env=env, cwd=directory, capture_output=True, text=True, timeout=30)
+                                 "--gtest_filter=KwinCaptureReconnectNestedTest.*",
+                                 "--gtest_repeat=" + os.environ.get("SUNSHINE_TEST_RESIZE_REPEAT", "1")],
+                                env=env, cwd=directory, capture_output=True, text=True, timeout=90)
+        (directory / "capture-resize.log").write_text(result.stdout + result.stderr)
         assert result.returncode == 0 and "[       OK ]" in result.stdout, result.stdout + result.stderr
+        evidence = directory / "in-session-resize.log"
+        assert evidence.exists(), "in-session resize proof was not produced"
+        print(evidence.read_text(), end="", flush=True)
         assert not any(module.owned(o) for o in state())
         print("PASS: real kwin_display landscape capture, retained screencast portrait reconnect, portrait PipeWire frames and final removal", flush=True)
     except Exception:
@@ -478,6 +489,7 @@ workspace.stackingOrder.filter(function(w) { return w.caption.indexOf('exclusive
                     else:
                         process.kill()
                     process.wait(timeout=5)
+            print(f"NESTED_STOPPED pid={process.pid} status={process.poll()}", flush=True)
         for log in logs:
             log.close()
     return 0

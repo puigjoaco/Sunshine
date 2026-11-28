@@ -83,8 +83,8 @@ namespace pipewire {
     std::atomic<int> transfer_function {0};  ///< PipeWire transfer-function metadata for the stream.
     std::atomic<bool> dmabuf {false};  ///< Whether the negotiated capture format uses DMA-BUF.
     std::atomic<bool> stream_dead {false};  ///< Whether the PipeWire stream has been destroyed.
-    pw_stream_state previous_state;  ///< Previous PipeWire stream state reported by callbacks.
-    pw_stream_state current_state;  ///< Current PipeWire stream state reported by callbacks.
+    pw_stream_state previous_state = PW_STREAM_STATE_UNCONNECTED;  ///< Previous PipeWire stream state reported by callbacks.
+    pw_stream_state current_state = PW_STREAM_STATE_UNCONNECTED;  ///< Current PipeWire stream state reported by callbacks.
     std::string err_msg;  ///< Last PipeWire error message reported by the stream.
   };
 
@@ -92,11 +92,11 @@ namespace pipewire {
    * @brief PipeWire stream handle, format, and shared state pointer.
    */
   struct stream_data_t {
-    struct pw_stream *stream;  ///< PipeWire stream handle used for screencast frames.
-    struct spa_hook stream_listener;  ///< Hook registering callbacks on the PipeWire stream.
-    struct spa_video_info format;  ///< Negotiated PipeWire video format.
-    struct pw_buffer *current_buffer;  ///< PipeWire buffer currently exposed to the capture thread.
-    uint64_t drm_format;  ///< DRM format.
+    struct pw_stream *stream = nullptr;  ///< PipeWire stream handle used for screencast frames.
+    struct spa_hook stream_listener {};  ///< Hook registering callbacks on the PipeWire stream.
+    struct spa_video_info format {};  ///< Negotiated PipeWire video format.
+    struct pw_buffer *current_buffer = nullptr;  ///< PipeWire buffer currently exposed to the capture thread.
+    uint64_t drm_format = 0;  ///< DRM format.
     std::shared_ptr<shared_state_t> shared;  ///< State shared between PipeWire callbacks and the capture backend.
     std::mutex frame_mutex;  ///< Synchronizes access to the current PipeWire frame.
     std::condition_variable frame_cv;  ///< Signals arrival or release of a PipeWire frame.
@@ -492,13 +492,13 @@ namespace pipewire {
 
   private:
     struct pw_thread_loop *loop;
-    struct pw_context *context;
-    struct pw_core *core;
-    struct spa_hook core_listener;
+    struct pw_context *context = nullptr;  ///< Null until initialization succeeds; failure teardown is safe.
+    struct pw_core *core = nullptr;  ///< Core connection owned by this consumer only.
+    struct spa_hook core_listener {};  ///< Listener is empty before attaching to the core.
     struct stream_data_t stream_data;
-    int fd;
-    uint32_t node;
-    uint64_t object_serial;
+    int fd = -1;  ///< No borrowed descriptor exists before init().
+    uint32_t node = PW_ID_ANY;  ///< Source identity is assigned by init().
+    uint64_t object_serial = SPA_ID_INVALID;  ///< Optional stable source serial assigned by init().
     bool negotiate_maxframerate_ = true;
 
     struct spa_pod *build_format_parameter(struct spa_pod_builder *b, uint32_t width, uint32_t height, AVRational target_framerate, int32_t format, uint64_t *modifiers, int n_modifiers) {
@@ -1043,7 +1043,9 @@ namespace pipewire {
         }
 
         std::shared_ptr<platf::img_t> img_out;
-        switch (const auto status = snapshot(pull_free_image_cb, img_out, 1000ms, *cursor)) {
+        // Owned outputs also poll the session resize mailbox through the frame
+        // callback. Bound that latency when KWin has no damage to publish.
+        switch (const auto status = snapshot(pull_free_image_cb, img_out, owns_virtual_output() ? 100ms : 1000ms, *cursor)) {
           case platf::capture_e::reinit:
           case platf::capture_e::error:
           case platf::capture_e::interrupted:

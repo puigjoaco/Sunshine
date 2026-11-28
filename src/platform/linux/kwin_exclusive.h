@@ -39,6 +39,8 @@ namespace kwin {
      * @return True after the guardian verifies the sole enabled output.
      */
     bool begin(const void *identity, const std::string &name);
+    /** @brief Refit the active output's layout without replacing its recovery snapshot. */
+    bool resize(const void *identity, const std::string &name);
     /**
      * @brief Claim the parked output before its deadline, cancelling the timer.
      * @return Retained screencast output, or null if no parked output can be claimed.
@@ -60,7 +62,7 @@ namespace kwin {
     /** @brief Start the joined grace worker without changing any output. */
     exclusive_t();
     /** @brief Start the guardian if needed and exchange one bounded JSON request. */
-    bool request(const std::string &command);
+    bool request(const std::string &command, std::chrono::milliseconds timeout = std::chrono::seconds(40));
     /** @brief Close the lifeline and reap the guardian without killing recovery. */
     void disconnect();
     /** @brief Restore the saved desk before releasing a parked output. */
@@ -77,6 +79,8 @@ namespace kwin {
     bool stopping = false;  ///< Requests immediate exit restoration.
     int channel = -1;  ///< Private guardian lifeline; EOF means immediate restore.
     int guardian = -1;  ///< Child PID for bounded reaping.
+    uint64_t request_id = 0;  ///< Correlates replies after a bounded resize request times out.
+    std::string response_buffer;  ///< Retains a partial reply across bounded request timeouts.
     std::optional<std::array<float, 4>> cursor;  ///< Physical recovery position and desktop bounds, if needed.
     std::thread worker;  ///< Grace-period timer; no detached Sunshine thread.
   };

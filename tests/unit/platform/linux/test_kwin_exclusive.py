@@ -50,6 +50,41 @@ class ExclusiveTest(unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
 
+    def test_resize_refits_without_replacing_snapshot_or_panel_heights(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.json"
+            guardian = exclusive.Guardian(path, None)
+            guardian.state = recovery_state()
+            guardian.state["policy"] = "mirror"
+            guardian.active_output = "Virtual-Sunshine-test"
+            exclusive.atomic_save(path, guardian.state)
+            before = path.read_bytes()
+            physical, target = output(), output(guardian.active_output)
+            target.update(id=2, pos={"x": 0, "y": 0})
+            physical.update(priority=2, replicationSource=2)
+            with patch.object(exclusive, "outputs", return_value=[physical, target]), \
+                    patch.object(exclusive, "doctor"), patch.object(exclusive, "replication"), \
+                    patch.object(guardian, "script", return_value=True) as script, \
+                    patch.object(guardian, "prepare") as prepare, patch.object(guardian, "move_plasma") as plasma:
+                guardian.resize(guardian.active_output)
+                prepare.assert_not_called()
+                plasma.assert_not_called()
+                self.assertIn("setMaximize(true,true,before)", script.call_args[0][0])
+                self.assertIn("pending[String(w.internalId)]", script.call_args[0][0])
+            self.assertEqual(path.read_bytes(), before)
+
+    def test_resize_requires_active_owner_without_desktop_access(self):
+        with tempfile.TemporaryDirectory() as directory:
+            guardian = exclusive.Guardian(Path(directory) / "state.json", None)
+            with patch.object(exclusive, "outputs") as outputs:
+                with self.assertRaises(RuntimeError):
+                    guardian.resize("Virtual-Sunshine-test")
+                guardian.state = recovery_state()
+                guardian.active_output = "Virtual-Sunshine-other"
+                with self.assertRaises(RuntimeError):
+                    guardian.resize("Virtual-Sunshine-test")
+                outputs.assert_not_called()
+
     def test_snapshot_excludes_owned_outputs_and_no_window_content(self):
         saved = exclusive.snapshot_outputs([output(), output("Virtual-Sunshine-test")])
         self.assertEqual([o["name"] for o in saved], ["DP-1"])

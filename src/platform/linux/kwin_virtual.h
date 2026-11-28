@@ -30,7 +30,7 @@ namespace kwin {
    * @return A bounded, validated request, or no value.
    */
   inline std::optional<virtual_mode_t> virtual_mode(bool enabled, bool client_stream, int width, int height, double fps, int scale_percent) {
-    if (!enabled || !client_stream || width < 320 || height < 200 || width > 16384 || height > 16384 || !std::isfinite(fps) || fps < 1 || fps > 1000 || scale_percent < 100 || scale_percent > 400) {
+    if (!enabled || !client_stream || width < 256 || height < 200 || width > 16384 || height > 16384 || !std::isfinite(fps) || fps < 1 || fps > 1000 || scale_percent < 100 || scale_percent > 400) {
       return std::nullopt;
     }
     return virtual_mode_t {width, height, static_cast<int>(std::lround(fps * 1000)), scale_percent / 100.0};
