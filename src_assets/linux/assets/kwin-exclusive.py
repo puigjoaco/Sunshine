@@ -10,6 +10,7 @@ python3-gi and kscreen-doctor. Window titles and application contents are never
 collected. Run as the desktop user, in the same Wayland/D-Bus session.
 """
 import argparse
+from contextlib import contextmanager
 import fcntl
 import json
 import math
@@ -26,12 +27,34 @@ import uuid
 ROTATIONS = {1: "none", 2: "left", 4: "inverted", 8: "right",
              16: "flipped", 32: "flipped90", 64: "flipped180", 128: "flipped270"}
 SCRIPT_NAME = "sunshine-exclusive"
+RECOVERY_TIMEOUT = 7
+WINDOW_TIMEOUT = 2.5
+OPERATION = threading.local()
+
+
+def operation_timeout():
+    """Share recovery time across subprocesses and script acknowledgements."""
+    remaining = min(5, getattr(OPERATION, "deadline", float("inf")) - time.monotonic())
+    if remaining <= 0:
+        raise TimeoutError("Exclusive recovery time budget exhausted; safety-critical snapshot retained")
+    return remaining
+
+
+@contextmanager
+def operation_budget(deadline):
+    """Narrow a thread's budget without extending an enclosing recovery deadline."""
+    previous = getattr(OPERATION, "deadline", float("inf"))
+    OPERATION.deadline = min(previous, deadline)
+    try:
+        yield
+    finally:
+        OPERATION.deadline = previous
 
 
 def run(*args):
     """Run one bounded subprocess without a shell."""
     return subprocess.run(args, check=True, capture_output=True, text=True,
-                          timeout=5).stdout.strip()
+                          timeout=operation_timeout()).stdout.strip()
 
 
 def outputs():
@@ -235,6 +258,7 @@ class Guardian:
     def __init__(self, path, reporter):
         self.path, self.reporter = path, reporter
         self.pointer = None
+        self.recovery_deadline = None
         try:
             self.state = json.loads(path.read_text()) if path.exists() else None
             if self.state is not None and (self.state.get("version", 1) not in (1, 2, 3) or not isinstance(self.state.get("outputs"), list) or not isinstance(self.state.get("windows"), list)):
@@ -256,7 +280,7 @@ class Guardian:
             if int(index) < 0:
                 raise RuntimeError("KWin refused the exclusive script")
             run("qdbus6", "org.kde.KWin", "/Scripting/Script" + index, "org.kde.kwin.Script.run")
-            if not event.wait(5):
+            if not event.wait(operation_timeout()):
                 raise RuntimeError("KWin script did not acknowledge its operation")
             return self.reporter.pending[token][1]
         finally:
@@ -273,6 +297,7 @@ class Guardian:
         if self.state is not None and (self.state.get("output_recovery") or self.state.get("snapshot_pending")):
             raise RuntimeError("Previous recovery is incomplete; original snapshot retained")
         if self.state is None:
+            self.recovery_deadline = None
             self.pointer = None
             saved = snapshot_outputs(outputs())
             rows = self.script("""
@@ -536,7 +561,7 @@ print(JSON.stringify(missing.length===0 ? true : {mismatches:missing}));
                 raise RuntimeError("Plasma restore incomplete; connector or containment assignment missing; original snapshot retained: " + json.dumps(result))
             time.sleep(0.1)
 
-    def recover_desktop(self):
+    def recover_desktop(self, windows=True):
         """Bring panels and surviving windows onto available physical outputs."""
         live = outputs()
         available = [o for o in live if o["connected"] and o["enabled"] and not owned(o) and not o.get("replicationSource", 0)]
@@ -544,9 +569,20 @@ print(JSON.stringify(missing.length===0 ? true : {mismatches:missing}));
             raise RuntimeError("No available physical desktop for degraded recovery")
         primary = min(available, key=lambda o: o["priority"] or 1000)["name"]
         self.move_plasma(primary)
-        result = self.script("var NAMES=" + json.dumps([o["name"] for o in available]) + ";var PRIMARY=" + json.dumps(primary) + ";var IDS=" + json.dumps([w["id"] for w in self.state["windows"]]) + ";" + """
+        if not windows:
+            return
+        excluded = self.state.get("window_recovery", []) + self.state.get("window_abandoned", [])
+        ids = [w["id"] for w in self.state["windows"] if w["id"] not in excluded]
+        result = None
+        try:
+            # Same best-effort window budget as exact recovery; the compositor
+            # stops writing at the deadline even if unloading the script fails.
+            with operation_budget(time.monotonic() + WINDOW_TIMEOUT):
+                deadline = round((time.time() + operation_timeout()) * 1000)
+                result = self.script("var NAMES=" + json.dumps([o["name"] for o in available]) + ";var PRIMARY=" + json.dumps(primary) + ";var IDS=" + json.dumps(ids) + ";var DEADLINE=" + str(deadline) + ";" + """
 var tries=0;
 function recover() {
+    if(Date.now()>=DEADLINE) {timer.stop();return;}
     var target=screen(PRIMARY);
     if(target) windows().filter(function(w){return IDS.indexOf(String(w.internalId))>=0;}).forEach(function(w){
         if(NAMES.indexOf(w.output.name)<0) workspace.sendClientToScreen(w,target);
@@ -565,8 +601,11 @@ function recover() {
 }
 var timer=new QTimer();timer.interval=100;timer.timeout.connect(recover);timer.start();
 """)
+        except Exception:
+            pass  # Window placement is best effort; outputs/Plasma decide retention.
         if result is not True:
-            raise RuntimeError("Degraded window recovery incomplete; original snapshot retained: " + json.dumps(result))
+            print("exclusive degraded window recovery incomplete: " + json.dumps(result), file=sys.stderr)
+        self.abandon_windows(self.state, "degraded restore")
 
     def park_virtual_outputs(self):
         """Expose physical Plasma screens while retained virtual outputs still exist."""
@@ -588,8 +627,22 @@ var timer=new QTimer();timer.interval=100;timer.timeout.connect(recover);timer.s
         if args:
             doctor(args)
 
-    def restore(self, finish=True):
-        """Restore monitors first, then surviving windows; retain state on any failure."""
+    def recover_previous(self):
+        """Recover safety-critical state before connect without replaying old windows."""
+        if self.state is not None:
+            self.restore(windows=False)
+
+    def restore(self, finish=True, windows=True):
+        """Bound the entire recovery cycle, including output/final phases and EOF."""
+        if self.state is None:
+            return
+        if self.recovery_deadline is None:
+            self.recovery_deadline = time.monotonic() + RECOVERY_TIMEOUT
+        with operation_budget(self.recovery_deadline):
+            self._restore(finish, windows)
+
+    def _restore(self, finish, windows):
+        """Retain failed output/Plasma recovery; window restoration is best effort."""
         if self.state is None:
             return
         saved = self.state
@@ -603,12 +656,15 @@ var timer=new QTimer();timer.interval=100;timer.timeout.connect(recover);timer.s
             self.state = None
             print("exclusive: stale recovery snapshot archived; current desktop unchanged", file=sys.stderr)
             return
+        if not windows:
+            self.abandon_windows(saved, "new guardian")
         try:
             self.unload()
         except Exception as error:
             print(f"exclusive: cannot unload script: {error}", file=sys.stderr)
         if saved.get("snapshot_pending"):
-            self.rollback_snapshot()
+            if windows:
+                self.rollback_snapshot()
             self.path.unlink()
             self.path.with_suffix(".js").unlink(missing_ok=True)
             sync_directory(self.path.parent)
@@ -649,7 +705,10 @@ var timer=new QTimer();timer.interval=100;timer.timeout.connect(recover);timer.s
             temporary = [o for o in current if not owned(o) and owned(by_id.get(o.get("replicationSource", 0), {"name": ""}))]
             replication([(o["name"], "") for o in temporary])
             self.park_virtual_outputs()
-            self.recover_desktop()
+            if windows:
+                self.recover_desktop()
+            else:
+                self.recover_desktop(windows=False)
             raise RuntimeError("Degraded desktop recovery completed; original snapshot retained")
         self.park_virtual_outputs()
         print(f"exclusive: physical outputs restored elapsed_ms={(time.monotonic()-started)*1000:.1f}", file=sys.stderr)
@@ -663,8 +722,12 @@ var timer=new QTimer();timer.interval=100;timer.timeout.connect(recover);timer.s
         except Exception as error:
             plasma_error = error
         print(f"exclusive: Plasma restored elapsed_ms={(time.monotonic()-started)*1000:.1f}", file=sys.stderr)
-        self.pointer = self.cursor_target()
-        self.restore_windows(saved)
+        if windows:
+            try:
+                self.pointer = self.cursor_target()
+            except Exception as error:
+                print(f"exclusive cursor recovery: {error}", file=sys.stderr)
+            self.restore_windows(saved)
         print(f"exclusive: windows restored elapsed_ms={(time.monotonic()-started)*1000:.1f}", file=sys.stderr)
         if plasma_error is not None:
             raise plasma_error
@@ -689,23 +752,35 @@ if(!physical.length || physical.some(function(s){var g=s.geometry;return p.x>=g.
 """.replace('PRIMARY', json.dumps(min(self.state["outputs"], key=lambda o: o["priority"] or 1000)["name"])))
 
     def restore_windows(self, saved):
-        """Retry only pending originals after settling, without delaying convergence."""
-        for attempt in range(3):
-            result = self.restore_windows_attempt(saved)
-            if isinstance(result, dict) and not result.get("mismatches"):
-                return
-            if attempt < 2:
-                print(f"exclusive: pending windows retry={attempt + 1}", file=sys.stderr)
-                time.sleep(0.5)
-        raise RuntimeError("Window restore incomplete; original snapshot retained: " + json.dumps(result))
+        """Try windows once within a total budget; abandon failures permanently."""
+        try:
+            with operation_budget(time.monotonic() + WINDOW_TIMEOUT):
+                self.restore_windows_attempt(saved)
+        except Exception:
+            # Missing acknowledgements and subprocess timeouts are best effort
+            # too. Log only opaque IDs, never client titles or script contents.
+            pass
+        self.abandon_windows(saved, "bounded restore")
+
+    def abandon_windows(self, saved, reason):
+        """Durably exclude unresolved originals from every later recovery attempt."""
+        excluded = saved.get("window_recovery", []) + saved.get("window_abandoned", [])
+        pending = [w["id"] for w in saved.get("windows", []) if w["id"] not in excluded]
+        if pending:
+            saved["window_abandoned"] = saved.get("window_abandoned", []) + pending
+            atomic_save(self.path, saved)
+            print("exclusive: abandoned windows reason=" + reason + " ids=" + json.dumps(pending), file=sys.stderr)
 
     def restore_windows_attempt(self, saved):
         """Run one bounded phased pass and durably exclude completed/user-owned windows."""
         completed = saved.get("window_recovery", [])
-        rows = [w for w in saved["windows"] if w["id"] not in completed]
+        rows = [w for w in saved["windows"] if w["id"] not in completed + saved.get("window_abandoned", [])]
         if not rows:
             return {"completed": [], "mismatches": []}
-        result = self.script("var SAVED=" + json.dumps(rows) + ";\n" + """
+        # The compositor also stops writing after the deadline if a timed-out
+        # D-Bus call prevents Python from unloading its script immediately.
+        deadline = round((time.time() + operation_timeout()) * 1000)
+        result = self.script("var SAVED=" + json.dumps(rows) + ";\nvar DEADLINE=" + str(deadline) + ";\n" + """
 var tries=0, stable={}, done={}, skipped={};
 function sameRect(a,b) {
     return Math.abs(a.x-b.x)<0.5 && Math.abs(a.y-b.y)<0.5 &&
@@ -721,6 +796,7 @@ function matches(w,s) {
 function restore() {
     var byId={};windows().forEach(function(w){byId[String(w.internalId)]=w;});
     SAVED.forEach(function(s){
+        if(Date.now()>=DEADLINE) return;
         if(done[s.id] || skipped[s.id]) return;
         var w=byId[s.id], target=screen(s.output);
         if(!w) {done[s.id]=true;return;} // Closed windows are never reopened.
@@ -761,7 +837,7 @@ function restore() {
     });
     ++tries;
     var pending=SAVED.filter(function(s){return !done[s.id] && !skipped[s.id];});
-    if(pending.length && tries<60) return;
+    if(pending.length && tries<40 && Date.now()<DEADLINE) return; // Leave budget headroom.
     timer.stop();
     report({completed:Object.keys(done).concat(Object.keys(skipped)),mismatches:pending.map(function(s){
         var w=byId[s.id];return {id:s.id,expected:s,actual:w ? {geometry:rect(w.frameGeometry),output:w.output.name,
@@ -865,8 +941,7 @@ def main():
             if args.action == "restore":
                 guardian.restore()
                 return
-            if guardian.state is not None:
-                guardian.restore()  # Recover an interrupted previous process first.
+            guardian.recover_previous()
             buffer = b""
             while not force.is_set():
                 if not select.select([sys.stdin], [], [], 0.1)[0]:
@@ -894,9 +969,8 @@ def main():
                         response = {"ok": True, "pointer": guardian.pointer}
                     except Exception as error:
                         print(f"exclusive: {error}", file=sys.stderr)
-                        # Initialization must recover immediately. Window restore
-                        # already retries pending rows; EOF below gives a failed
-                        # teardown one final bounded recovery before exiting.
+                        # Initialization recovers immediately. EOF shares the
+                        # same deadline and never retries abandoned windows.
                         if request.get("action") not in ("restore", "restore-outputs"):
                             try:
                                 guardian.restore()

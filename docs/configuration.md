@@ -1074,11 +1074,16 @@ so clients see that output disappear before their final window configures.
 The guardian restores Plasma assignments, then surviving original windows in
 separate unmaximize, geometry and state phases. It verifies output, geometry and
 all saved states, finishes early after convergence, and durably records each
-completed window. Pending windows get up to three bounded passes with short
-settling pauses only after a mismatch. A failed teardown gets a final bounded
-recovery when Sunshine closes the guardian lifeline; persistent failures retain
-the snapshot for emergency recovery. An unrelated mismatch cannot cause later
-recovery attempts to undo a completed window's newer placement. Failed exact
+completed window. Window recovery is best effort: one pass has a total 2.5-second
+budget, including script acknowledgement and subprocesses. Unresolved windows
+are logged by opaque ID and durably abandoned; they neither retain the snapshot
+nor get retried. Windows being dragged or resized by the user are left alone.
+The output, final restore and lifeline EOF paths share one seven-second recovery
+budget, below Sunshine's ten-second session termination watchdog. Only failed
+output or panel/Plasma recovery retains the snapshot for emergency recovery.
+A new guardian recovers those safety-critical parts before connecting, skipping
+all old window recovery. Later recovery never undoes completed or abandoned
+windows' newer placement. Failed exact
 restoration enables connected original outputs at preferred
 modes and retains the snapshot for retry. A lost guardian is recovered by
 Sunshine; a lost Sunshine lifeline triggers immediate guardian recovery.
@@ -1088,7 +1093,7 @@ crash that kills the entire service process group. Allow at least 60 seconds
 for service shutdown/recovery. Snapshots are bound to the boot and exact KWin/
 Wayland session. Foreign-session, legacy or corrupt snapshots are archived as
 `kwin-exclusive.stale-<id>.json` without changing the current desktop. Output
-recovery intent and completion are synced separately: a retained panel/window
+recovery intent and completion are synced separately: a retained panel/Plasma
 mismatch never causes the old monitor layout to be replayed over later user
 changes. After an interrupted output transaction, recovery brings the desktop
 onto available physical outputs and retains the original snapshot instead of

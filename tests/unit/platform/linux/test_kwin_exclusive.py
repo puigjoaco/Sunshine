@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import shutil
 import tempfile
+from types import SimpleNamespace
 import subprocess
 import sys
 import unittest
@@ -172,16 +173,16 @@ class ExclusiveTest(unittest.TestCase):
                 self.assertFalse(path.exists())
                 self.assertEqual(len(list(Path(directory).glob("state.stale-*.json"))), 1)
 
-    def test_window_mismatch_never_replays_completed_output_restore(self):
+    def test_window_mismatch_is_abandoned_and_snapshot_is_cleared(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "state.json"
             exclusive.atomic_save(path, recovery_state())
             guardian = exclusive.Guardian(path, None)
             with patch.object(guardian, "unload"), patch.object(exclusive, "outputs", return_value=[output()]), patch.object(exclusive, "doctor") as doctor, patch.object(guardian, "script", return_value=False):
-                with self.assertRaisesRegex(RuntimeError, "Window restore incomplete"):
-                    guardian.restore()
+                guardian.restore()
                 doctor.assert_called_once()
-            self.assertEqual(json.loads(path.read_text())["output_recovery"], "exact")
+            self.assertFalse(path.exists())
+            self.assertIsNone(guardian.state)
             restarted = exclusive.Guardian(path, None)
             with patch.object(restarted, "unload"), patch.object(exclusive, "outputs", return_value=[output()]), patch.object(exclusive, "doctor") as doctor, patch.object(restarted, "script", return_value=True):
                 restarted.restore()
@@ -222,7 +223,7 @@ class ExclusiveTest(unittest.TestCase):
             self.assertTrue(path.exists())
             self.assertEqual(json.loads(path.read_text())["output_recovery"], "exact")
 
-    def test_completed_windows_are_not_replayed_after_another_window_fails(self):
+    def test_completed_and_abandoned_windows_are_never_replayed(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "state.json"
             state = recovery_state()
@@ -230,49 +231,120 @@ class ExclusiveTest(unittest.TestCase):
             exclusive.atomic_save(path, state)
             guardian = exclusive.Guardian(path, None)
             with patch.object(guardian, "script", return_value={"completed": ["saved-window"], "mismatches": ["still-pending"]}) as attempts, patch.object(exclusive.time, "sleep") as sleep:
-                with self.assertRaisesRegex(RuntimeError, "Window restore incomplete"):
-                    guardian.restore_windows(guardian.state)
-            self.assertEqual(attempts.call_count, 3)
-            self.assertEqual(sleep.call_count, 2)
+                guardian.restore_windows(guardian.state)
+            attempts.assert_called_once()
+            sleep.assert_not_called()
             self.assertEqual(json.loads(path.read_text())["window_recovery"], ["saved-window"])
-            for retry in attempts.call_args_list[1:]:
-                declaration = retry.args[0].split(";\n", 1)[0]
-                self.assertNotIn('"id": "saved-window"', declaration)
-                self.assertIn('"id": "still-pending"', declaration)
+            self.assertEqual(json.loads(path.read_text())["window_abandoned"], ["still-pending"])
             restarted = exclusive.Guardian(path, None)
             with patch.object(restarted, "script", return_value=True) as script:
                 restarted.restore_windows(restarted.state)
-            declaration = script.call_args.args[0].split(";\n", 1)[0]
-            self.assertNotIn('"id": "saved-window"', declaration)
-            self.assertIn('"id": "still-pending"', declaration)
-            self.assertCountEqual(restarted.state["window_recovery"], ["saved-window", "still-pending"])
+            script.assert_not_called()
+            self.assertEqual(restarted.state["window_recovery"], ["saved-window"])
+            self.assertEqual(restarted.state["window_abandoned"], ["still-pending"])
 
-    def test_pending_window_retries_after_settling_and_finishes_recovery(self):
-        """A slow client converges without a new session or replaying completed stages."""
+    def test_never_converging_window_does_not_retain_plasma_failure_retry(self):
+        """Only a safety-critical failure survives; EOF cannot retry old windows."""
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "state.json"
             state = recovery_state()
             state["windows"].append(dict(state["windows"][0], id="slow-window"))
             exclusive.atomic_save(path, state)
             guardian = exclusive.Guardian(path, None)
-            calls = []
-
-            def script(code):
-                calls.append(code.split(";\n", 1)[0])
-                if len(calls) == 1:
-                    return {"completed": ["saved-window"], "mismatches": ["slow-window"]}
-                self.assertEqual(json.loads(path.read_text())["window_recovery"], ["saved-window"])
-                return {"completed": ["slow-window"], "mismatches": []}
-
-            with patch.object(guardian, "unload"), patch.object(exclusive, "outputs", return_value=[output()]), patch.object(exclusive, "doctor") as doctor, patch.object(guardian, "script", side_effect=script), patch.object(exclusive.time, "sleep") as sleep:
+            with patch.object(guardian, "unload"), patch.object(exclusive, "outputs", return_value=[output()]), patch.object(exclusive, "doctor") as doctor, patch.object(guardian, "script", return_value={"completed": ["saved-window"], "mismatches": ["slow-window"]}) as script, patch.object(guardian, "restore_plasma", side_effect=RuntimeError("Plasma mismatch")):
+                with self.assertRaisesRegex(RuntimeError, "Plasma mismatch"):
+                    guardian.restore()
+            self.assertEqual(json.loads(path.read_text())["window_abandoned"], ["slow-window"])
+            script.assert_called_once()
+            with patch.object(guardian, "unload"), patch.object(exclusive, "outputs", return_value=[output()]), patch.object(exclusive, "doctor") as replay, patch.object(guardian, "script") as windows, patch.object(guardian, "restore_plasma"):
                 guardian.restore()
+                guardian.restore()  # Final EOF recovery is now a no-op.
             doctor.assert_called_once()
-            sleep.assert_called_once_with(0.5)
-            self.assertEqual(len(calls), 2)
-            self.assertNotIn('"id": "saved-window"', calls[1])
-            self.assertIn('"id": "slow-window"', calls[1])
+            replay.assert_not_called()
+            windows.assert_not_called()
             self.assertFalse(path.exists())
             self.assertIsNone(guardian.state)
+
+    def test_script_without_acknowledgement_uses_total_window_budget(self):
+        """A stuck client/script cannot spend five seconds per D-Bus operation."""
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.json"
+            exclusive.atomic_save(path, recovery_state())
+            reporter = SimpleNamespace(name="test", pending={})
+            guardian = exclusive.Guardian(path, reporter)
+            clock = [0.0]
+            timeouts = []
+
+            def command(*args, **kwargs):
+                timeouts.append(kwargs["timeout"])
+                clock[0] += 0.1
+                return SimpleNamespace(stdout="1")
+
+            def wait(timeout):
+                timeouts.append(timeout)
+                clock[0] += timeout
+                return False
+
+            event = SimpleNamespace(wait=wait)
+            with patch.object(exclusive.time, "monotonic", side_effect=lambda: clock[0]), patch.object(exclusive.subprocess, "run", side_effect=command), patch.object(exclusive.threading, "Event", return_value=event):
+                guardian.restore_windows(guardian.state)
+            self.assertEqual(clock[0], exclusive.WINDOW_TIMEOUT)
+            self.assertEqual(timeouts, [2.5, 2.4, 2.3, 2.2])
+            self.assertEqual(reporter.pending, {})
+            self.assertEqual(json.loads(path.read_text())["window_abandoned"], ["saved-window"])
+
+    def test_recovery_deadline_is_shared_by_output_finish_and_eof(self):
+        """Timed-out desktop recovery retains its file without getting another budget."""
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.json"
+            exclusive.atomic_save(path, recovery_state())
+            guardian = exclusive.Guardian(path, None)
+            clock = [0.0]
+
+            def command(*args, **kwargs):
+                clock[0] += kwargs["timeout"]
+                raise subprocess.TimeoutExpired(args[0], kwargs["timeout"])
+
+            with patch.object(exclusive.time, "monotonic", side_effect=lambda: clock[0]), patch.object(exclusive.subprocess, "run", side_effect=command) as run, patch.object(exclusive, "recovery_identity", side_effect=lambda: exclusive.run("identity")):
+                for finish in (False, True, True):
+                    with self.assertRaises((subprocess.TimeoutExpired, TimeoutError)):
+                        guardian.restore(finish=finish)
+            self.assertEqual(clock[0], exclusive.RECOVERY_TIMEOUT)
+            self.assertEqual([call.kwargs["timeout"] for call in run.call_args_list], [5, 2])
+            self.assertTrue(path.exists())
+
+    def test_connect_recovers_outputs_and_plasma_without_any_old_window_script(self):
+        for pending in (False, True):
+            with self.subTest(snapshot_pending=pending), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "state.json"
+                state = recovery_state()
+                if pending:
+                    state["snapshot_pending"] = True
+                exclusive.atomic_save(path, state)
+                guardian = exclusive.Guardian(path, None)
+                with patch.object(guardian, "unload"), patch.object(exclusive, "outputs", return_value=[output()]), patch.object(exclusive, "doctor"), patch.object(guardian, "restore_plasma") as plasma, patch.object(guardian, "script", side_effect=AssertionError("Old windows blocked connect")), patch.object(guardian, "cursor_target", side_effect=AssertionError("Old cursor blocked connect")):
+                    guardian.recover_previous()
+                self.assertEqual(plasma.call_count, 0 if pending else 1)
+                self.assertFalse(path.exists())
+                self.assertIsNone(guardian.state)
+                # A new prepare is accepted immediately with a fresh recovery budget.
+                with patch.object(exclusive, "outputs", return_value=[output()]), patch.object(guardian, "script", return_value=[]):
+                    guardian.prepare()
+                self.assertIsNone(guardian.recovery_deadline)
+
+    def test_connect_degraded_recovery_never_attempts_old_windows(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.json"
+            state = recovery_state()
+            state["output_recovery"] = "degraded"
+            exclusive.atomic_save(path, state)
+            guardian = exclusive.Guardian(path, None)
+            with patch.object(guardian, "unload"), patch.object(exclusive, "outputs", return_value=[output()]), patch.object(exclusive, "replication"), patch.object(guardian, "move_plasma") as plasma, patch.object(guardian, "script") as windows:
+                with self.assertRaisesRegex(RuntimeError, "snapshot retained"):
+                    guardian.recover_previous()
+            plasma.assert_called_once()
+            windows.assert_not_called()
+            self.assertEqual(json.loads(path.read_text())["window_abandoned"], ["saved-window"])
 
     def test_window_fast_path_never_waits_or_retries_completed_windows(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -284,6 +356,63 @@ class ExclusiveTest(unittest.TestCase):
                 guardian.restore_windows(guardian.state)
             script.assert_called_once()
             sleep.assert_not_called()
+
+    @unittest.skipUnless(shutil.which("node"), "JavaScript replay requires node")
+    def test_window_timer_yields_to_user_and_never_revisits_completed_windows(self):
+        """Replay a stuck client next to a completed window and a user resize."""
+        with tempfile.TemporaryDirectory() as directory:
+            guardian = exclusive.Guardian(Path(directory) / "state.json", None)
+            saved = recovery_state()
+            saved["windows"] += [dict(saved["windows"][0], id="stuck"), dict(saved["windows"][0], id="dragged")]
+            with patch.object(guardian, "script", return_value=False) as script:
+                guardian.restore_windows(saved)
+            code = script.call_args.args[0]
+            replay = r"""
+const assert=require('node:assert/strict');
+const code=require('node:fs').readFileSync(0,'utf8').replace(/var DEADLINE=\d+;/,'var DEADLINE=2500;');
+const target={name:'DP-1'}, timers=[];
+let now=0;Date.now=()=>now;
+function QTimer(){this.timeout={connect:f=>this.callback=f};this.start=()=>timers.push(this);this.stop=()=>this.stopped=true;}
+function rect(g){return {...g};}
+function screen(){return target;}
+let result;
+function report(value){result=value;}
+function client(id){
+    let geometry={x:0,y:0,width:720,height:1504};
+    return {internalId:id,output:target,maximizeMode:0,fullScreen:false,minimized:false,
+        desktops:[],activities:[],resize:id==='dragged',writes:0,
+        get frameGeometry(){return {...geometry};},
+        set frameGeometry(g){++this.writes;if(id!=='stuck') geometry={...g};},
+        setMaximize(){++this.writes;}};
+}
+const clients=['saved-window','stuck','dragged'].map(client);
+function windows(){return clients;}
+const workspace={desktops:[],sendClientToScreen(w,s){w.output=s;}};
+eval(code);
+let completedWrites;
+for(let n=0;n<40;++n){
+    assert.equal(timers[0].stopped,undefined);
+    now+=50;timers[0].callback();
+    if(n===3) {
+        completedWrites=clients[0].writes;
+        clients[0].frameGeometry={x:500,y:600,width:700,height:800};
+    }
+}
+assert.equal(timers[0].stopped,true);
+assert.deepEqual(result.completed.sort(),['dragged','saved-window']);
+assert.deepEqual(result.mismatches.map(w=>w.id),['stuck']);
+assert.equal(clients[0].writes,completedWrites+1,'completed placement was replayed');
+assert.deepEqual(clients[0].frameGeometry,{x:500,y:600,width:700,height:800});
+assert.equal(clients[2].writes,0,'user resize was overwritten');
+// A delayed script invocation must not mutate any window after its deadline.
+timers.length=0;result=undefined;now+=10000;
+const before=clients.map(w=>w.writes);
+eval(code);timers[0].callback();
+assert.equal(timers[0].stopped,true);
+assert.deepEqual(clients.map(w=>w.writes),before);
+"""
+            result = subprocess.run(["node", "-e", replay], input=code, capture_output=True, text=True, timeout=5)
+            self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_unsettled_normal_geometry_rolls_back_before_discarding_snapshot(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -362,6 +491,7 @@ class ExclusiveTest(unittest.TestCase):
                     replay = r"""
 const assert=require('node:assert/strict');
 const input=JSON.parse(require('node:fs').readFileSync(0,'utf8'));
+Date.now=()=>0; // Synthetic timer ticks must not depend on the host's scheduling.
 const normal={x:150,y:100,width:600,height:400}, bounds={x:100,y:0,width:1920,height:1080};
 const copy=g=>({...g});
 let geometry=copy(normal), normalRestore=copy(normal), fullscreenRestore=copy(normal), result, readError=false;
@@ -461,6 +591,16 @@ assert.deepEqual(w.frameGeometry,normal,'later state exit must restore original 
             with patch.object(exclusive, "outputs", return_value=[virtual, physical]), patch.object(guardian, "move_plasma") as plasma, patch.object(guardian, "script", return_value=True):
                 guardian.recover_desktop()
             plasma.assert_called_once_with("DP-1")
+
+    def test_degraded_window_timeout_abandons_windows_without_raising(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.json"
+            exclusive.atomic_save(path, recovery_state())
+            guardian = exclusive.Guardian(path, None)
+            with patch.object(exclusive, "outputs", return_value=[output()]), patch.object(guardian, "move_plasma"), patch.object(guardian, "script", side_effect=TimeoutError("no acknowledgement")):
+                guardian.recover_desktop()
+            saved = json.loads(path.read_text())
+            self.assertEqual(saved["window_abandoned"], [w["id"] for w in saved["windows"]])
 
     def test_touch_panel_height_follows_client_scale(self):
         for scale, height in [(1, 44), (1.5, 44), (2, 56), (2.5, 70), (4, 112)]:
